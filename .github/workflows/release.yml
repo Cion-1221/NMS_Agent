@@ -1,0 +1,214 @@
+name: Build and Release NMS Agent
+
+# 仅在打 v* Tag 时发布 Release；workflow_dispatch 允许在不打 Tag 的情况下
+# 手动跑一遍完整的交叉编译矩阵，提前发现某个平台编译失败，而不必先发一个坏 Tag。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # softprops/action-gh-release 需要写权限才能创建 Release 并上传资产
+
+env:
+  BINARY_NAME: nms-agent
+  GO_VERSION: '1.26'
+  # Opt into Node.js 24 for all action runtimes before GitHub forces it on 2026-09-16.
+  # 本项目没有前端，但 actions/checkout、actions/setup-go 等官方 Action 仍跑在
+  # Node 运行时之上，统一开启不影响本项目，换来的是不会在某天被强制升级打断。
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  # ── 阶段一：静态检查 + 单测 ──────────────────────────────────────────────
+  # 只跑一次，不放进下面的交叉编译矩阵里重复跑 6 遍：go vet/go test 的结果
+  # 不依赖 GOOS/GOARCH（本项目没有任何 _windows.go / _linux.go 这类按平台
+  # 区分的源文件），矩阵里重复执行只会浪费 CI 分钟数。
+  verify:
+    name: Verify (vet + test)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Tidy, vet and test
+        run: |
+          go mod tidy
+          go vet ./...
+          go test ./...
+
+      - name: Determine release version
+        id: version
+        run: |
+          # tag 推送时 GITHUB_REF_NAME 形如 "v1.2.3"，去掉前导 v 得到纯版本号；
+          # workflow_dispatch 手动触发时 GITHUB_REF_NAME 是分支名，version 会
+          # 落回一个可识别的开发版本号，方便区分这是手动跑的产物而不是正式发布。
+          if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── 阶段二：交叉编译矩阵 ─────────────────────────────────────────────────
+  # CGO_ENABLED=0 是这里能成立的关键：纯 Go 静态二进制不需要目标平台的 C
+  # 工具链，因此 6 个平台/架构组合全部可以在同一个 ubuntu-latest 上交叉编译，
+  # 不需要真的找一台 Windows/macOS 机器来构建。
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          OUT="${BINARY_NAME}"
+          [ "${{ matrix.goos }}" = "windows" ] && OUT="${OUT}.exe"
+
+          LDFLAGS="-s -w"
+          LDFLAGS="${LDFLAGS} -X main.version=${{ needs.verify.outputs.version }}"
+          LDFLAGS="${LDFLAGS} -X main.commit=${GITHUB_SHA}"
+          LDFLAGS="${LDFLAGS} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # 必须编译整个包（.）而不是单个文件（main.go），
+          # 否则 package main 里的其他源文件不会参与编译。
+          go build -trimpath -ldflags "${LDFLAGS}" -o "dist/${OUT}" .
+
+      - name: Package release archive
+        id: package
+        working-directory: dist
+        run: |
+          PKG_NAME="${BINARY_NAME}_${{ needs.verify.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          mkdir "${PKG_NAME}" "${PKG_NAME}/configs"
+          cp ../README.md "${PKG_NAME}/"
+          cp ../configs/config.yaml "${PKG_NAME}/configs/"
+
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            mv "${BINARY_NAME}.exe" "${PKG_NAME}/"
+            ASSET="${PKG_NAME}.zip"
+            zip -r "${ASSET}" "${PKG_NAME}"
+          else
+            mv "${BINARY_NAME}" "${PKG_NAME}/"
+            ASSET="${PKG_NAME}.tar.gz"
+            tar -czf "${ASSET}" "${PKG_NAME}"
+          fi
+          echo "asset_path=dist/${ASSET}" >> "$GITHUB_OUTPUT"
+          echo "asset_name=${ASSET}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.asset_name }}
+          path: ${{ steps.package.outputs.asset_path }}
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── 阶段三：发布 Release ─────────────────────────────────────────────────
+  # 只在真正的 Tag 推送时执行；workflow_dispatch 手动触发只用来验证矩阵能不能
+  # 编译通过，不应该产生一个挂在 Release 列表里的"野发布"。
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 👈 极其重要：必须拉取完整的 Git 历史，否则找不到上一个 Tag
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum * > SHA256SUMS.txt
+
+      # ── 自动动态提取 Commit 历史 ─────────────────────────────────────────────
+      - name: Generate changelog
+        id: changelog
+        run: |
+          echo "CHANGELOG_TEXT<<EOF" >> "$GITHUB_ENV"
+          # 检查是否存在上一个 Tag，如果存在就提取两个 Tag 之间的所有单个 commit 记录
+          if git describe --tags --abbrev=0 HEAD^ >/dev/null 2>&1; then
+            LAST_TAG=$(git describe --tags --abbrev=0 HEAD^)
+            git log "${LAST_TAG}"..HEAD --oneline --pretty=format:"* %s (%h)" >> "$GITHUB_ENV"
+          else
+            # 如果是第一次发版找不到前任 Tag，则兜底打印最近 10 条 commit
+            git log -n 10 --oneline --pretty=format:"* %s (%h)" >> "$GITHUB_ENV"
+          fi
+          echo "" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NMS Agent ${{ github.ref_name }}
+          generate_release_notes: false # 👈 关闭 GitHub 自带的鸡肋对比页
+          files: |
+            release/*
+          body: |
+            ## 📥 下载说明
+
+            | 平台 | 架构 | 文件 |
+            |------|------|------|
+            | Linux | amd64 | `nms-agent_*_linux_amd64.tar.gz` |
+            | Linux | arm64 | `nms-agent_*_linux_arm64.tar.gz` |
+            | Windows | amd64 | `nms-agent_*_windows_amd64.zip` |
+            | Windows | arm64 | `nms-agent_*_windows_arm64.zip` |
+            | macOS (Intel) | amd64 | `nms-agent_*_darwin_amd64.tar.gz` |
+            | macOS (Apple Silicon) | arm64 | `nms-agent_*_darwin_arm64.tar.gz` |
+
+            每个压缩包内含二进制、示例 `configs/config.yaml` 与 `README.md`。解压后：
+
+            ```bash
+            ./nms-agent -config configs/config.yaml
+            ```
+
+            下载后建议核对 `SHA256SUMS.txt` 校验完整性。详细部署与配置说明请参阅
+            [README.md](https://github.com/${{ github.repository }}/blob/main/README.md)。
+
+            ---
+            ## 🚀 本次更新内容 (Changelog)
+            ${{ env.CHANGELOG_TEXT }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
