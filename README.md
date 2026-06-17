@@ -19,6 +19,7 @@
 - [双栈支持（IPv4/IPv6）](#双栈支持ipv4ipv6)
 - [安全设计](#安全设计)
 - [构建与发布](#构建与发布)
+- [配置 systemd 服务常驻](#配置-systemd-服务常驻)
 - [平台限制](#平台限制)
 - [License](#license)
 
@@ -318,6 +319,129 @@ git push origin v1.0.0
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
   go build -trimpath -ldflags "-s -w -X main.version=1.0.0" -o nms-agent_linux_arm64 .
 ```
+
+## 配置 systemd 服务常驻
+
+以下步骤适用于 Linux（systemd），使 NMS Agent 开机自启并在崩溃后自动重启。
+
+### 1. 创建系统用户
+
+```bash
+sudo useradd -r -s /sbin/nologin -d /var/lib/nms-agent -m nms-agent
+```
+
+ping 和 traceroute 依赖原始套接字（`CAP_NET_RAW`）。后续通过 Ambient Capabilities 按需授予专用账户，无需以 root 运行整个进程。
+
+### 2. 安装文件
+
+```bash
+# 二进制
+sudo install -o root -g root -m 755 nms-agent /usr/local/bin/nms-agent
+
+# 配置目录
+sudo mkdir -p /etc/nms-agent
+sudo install -o root -g nms-agent -m 640 configs/config.yaml /etc/nms-agent/config.yaml
+
+# 日志目录
+sudo mkdir -p /var/log/nms-agent
+sudo chown nms-agent:nms-agent /var/log/nms-agent
+
+# 证书目录（首次启动时自动创建，此处预建并授权）
+sudo mkdir -p /var/lib/nms-agent/.certs
+sudo chown -R nms-agent:nms-agent /var/lib/nms-agent
+```
+
+### 3. 注入敏感变量
+
+provisioning_token 通过独立的 EnvironmentFile 注入，避免明文写入配置文件或 unit 文件：
+
+```bash
+sudo tee /etc/nms-agent/env > /dev/null <<'EOF'
+NMS_TOKEN=your-one-time-provisioning-token
+EOF
+sudo chmod 600 /etc/nms-agent/env
+```
+
+### 4. 调整 config.yaml 路径
+
+生产环境改用绝对路径，与 systemd 的文件系统沙箱配合：
+
+```yaml
+server:
+  provisioning_token: "${NMS_TOKEN}"        # 从 EnvironmentFile 展开
+
+runtime:
+  log:
+    file: "/var/log/nms-agent/nms-agent.log"
+
+certs:
+  dir: "/var/lib/nms-agent/.certs"
+```
+
+### 5. 创建 unit 文件
+
+```bash
+sudo tee /etc/systemd/system/nms-agent.service > /dev/null <<'EOF'
+[Unit]
+Description=NMS Agent — network probe edge node
+Documentation=https://github.com/Cion-1221/NMS_Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nms-agent
+Group=nms-agent
+ExecStart=/usr/local/bin/nms-agent -config /etc/nms-agent/config.yaml
+Restart=on-failure
+RestartSec=10s
+# 略长于 config.yaml 的 grace_period（30s），确保 Agent 完成优雅停机后
+# systemd 再强制终止，而不是抢先发出 SIGKILL。
+TimeoutStopSec=35s
+
+# 从独立文件注入敏感环境变量；前置 - 表示文件不存在时不报错
+EnvironmentFile=-/etc/nms-agent/env
+
+# ping / traceroute 需要 CAP_NET_RAW；Ambient Capabilities 仅授予此能力，
+# 不以 root 运行整个进程。
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# 运行时需要写入的目录须在此明确列出（ProtectSystem=strict 默认只读）
+ReadWritePaths=/var/log/nms-agent /var/lib/nms-agent
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+### 6. 启用并启动
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now nms-agent
+```
+
+### 常用管理命令
+
+```bash
+sudo systemctl status nms-agent          # 运行状态
+sudo systemctl restart nms-agent         # 重启（修改配置后执行）
+sudo systemctl stop nms-agent            # 停止
+
+# 实时跟踪 journald 日志
+sudo journalctl -u nms-agent -f
+
+# 或直接查看 lumberjack 管理的滚动日志文件
+sudo tail -f /var/log/nms-agent/nms-agent.log
+```
+
+> **提示**：首次 enrollment 成功后（日志出现 `enrollment successful`），可将 `/etc/nms-agent/env` 中的 `NMS_TOKEN` 行删除或置空——之后凭 mTLS 证书鉴权，provisioning token 不再使用。
 
 ## 平台限制
 
