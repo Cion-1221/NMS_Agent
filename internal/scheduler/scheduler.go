@@ -121,8 +121,18 @@ func (s *Scheduler) reconcile(ctx context.Context, runners map[int]*taskRunner) 
 		}
 	}
 
-	// Start goroutines for newly-added tasks.
+	// Start goroutines for new tasks; restart if targets or interval changed.
+	// Targets are captured at goroutine launch and the ticker is fixed, so any
+	// server-side update to a task requires cancelling and recreating the runner.
 	for _, t := range tasks {
+		if existing, exists := runners[t.TaskID]; exists && taskChanged(existing.task, t) {
+			existing.cancel()
+			delete(runners, t.TaskID)
+			slog.Info("scheduler: task config changed — restarting",
+				"task_id", t.TaskID, "type", t.Type,
+				"old_targets", len(existing.task.Targets),
+				"new_targets", len(t.Targets))
+		}
 		if _, exists := runners[t.TaskID]; !exists {
 			taskCtx, cancel := context.WithCancel(ctx)
 			runners[t.TaskID] = &taskRunner{task: t, cancel: cancel}
@@ -134,6 +144,24 @@ func (s *Scheduler) reconcile(ctx context.Context, runners map[int]*taskRunner) 
 
 	slog.Debug("scheduler: reconciled",
 		"running_tasks", len(runners), "source_ip", sourceIP)
+}
+
+// taskChanged reports whether the server updated a task's probe parameters.
+// Targets are passed by value into runTask at launch time, and the interval
+// ticker is fixed — either change requires cancelling and recreating the goroutine.
+func taskChanged(old, cur probe.Task) bool {
+	if old.IntervalSeconds != cur.IntervalSeconds || old.Type != cur.Type {
+		return true
+	}
+	if len(old.Targets) != len(cur.Targets) {
+		return true
+	}
+	for i := range old.Targets {
+		if old.Targets[i] != cur.Targets[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scheduler) fetchTasks(ctx context.Context) ([]probe.Task, string, error) {

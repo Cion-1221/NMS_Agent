@@ -322,53 +322,128 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
 
 ## 配置 systemd 服务常驻
 
-以下步骤适用于 Linux（systemd），使 NMS Agent 开机自启并在崩溃后自动重启。
+以下步骤适用于 Linux（systemd），使 NMS Agent 开机自启并在崩溃后自动重启。提供两种部署布局：**自包含目录**（简单，以 root 运行）和**专用账户**（生产推荐）。
 
-### 1. 创建系统用户
+---
 
-```bash
-sudo useradd -r -s /sbin/nologin -d /var/lib/nms-agent -m nms-agent
+### 方式一：自包含目录（root）
+
+所有文件放在同一个目录下，适合快速部署或单机场景。
+
+**目录布局**
+
+```
+/opt/nms-agent/
+├── nms-agent            # 二进制
+├── configs/
+│   └── config.yaml
+├── env                  # 敏感变量（chmod 600）
+├── .certs/              # enrollment 后自动生成
+└── logs/                # 日志文件
 ```
 
-ping 和 traceroute 依赖原始套接字（`CAP_NET_RAW`）。后续通过 Ambient Capabilities 按需授予专用账户，无需以 root 运行整个进程。
+**config.yaml 使用相对路径即可**（`WorkingDirectory` 会将工作目录固定为 `/opt/nms-agent`）：
 
-### 2. 安装文件
+```yaml
+runtime:
+  log:
+    file: "logs/nms-agent.log"
 
-```bash
-# 二进制
-sudo install -o root -g root -m 755 nms-agent /usr/local/bin/nms-agent
-
-# 配置目录
-sudo mkdir -p /etc/nms-agent
-sudo install -o root -g nms-agent -m 640 configs/config.yaml /etc/nms-agent/config.yaml
-
-# 日志目录
-sudo mkdir -p /var/log/nms-agent
-sudo chown nms-agent:nms-agent /var/log/nms-agent
-
-# 证书目录（首次启动时自动创建，此处预建并授权）
-sudo mkdir -p /var/lib/nms-agent/.certs
-sudo chown -R nms-agent:nms-agent /var/lib/nms-agent
+certs:
+  dir: ".certs"
 ```
 
-### 3. 注入敏感变量
-
-provisioning_token 通过独立的 EnvironmentFile 注入，避免明文写入配置文件或 unit 文件：
+**注入 provisioning token**
 
 ```bash
-sudo tee /etc/nms-agent/env > /dev/null <<'EOF'
+cat > /opt/nms-agent/env <<'EOF'
 NMS_TOKEN=your-one-time-provisioning-token
 EOF
-sudo chmod 600 /etc/nms-agent/env
+chmod 600 /opt/nms-agent/env
 ```
 
-### 4. 调整 config.yaml 路径
+**unit 文件**
 
-生产环境改用绝对路径，与 systemd 的文件系统沙箱配合：
+```bash
+tee /etc/systemd/system/nms-agent.service > /dev/null <<'EOF'
+[Unit]
+Description=NMS Agent — network probe edge node
+Documentation=https://github.com/Cion-1221/NMS_Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+# WorkingDirectory 是关键：config.yaml 中的相对路径（logs/、.certs/）
+# 均以此目录为基准解析，不设则默认为 /，路径全部错误。
+WorkingDirectory=/opt/nms-agent
+ExecStart=/opt/nms-agent/nms-agent -config /opt/nms-agent/configs/config.yaml
+Restart=on-failure
+RestartSec=10s
+# 略长于 grace_period（30s），确保 Agent 完成优雅停机后 systemd 再发 SIGKILL
+TimeoutStopSec=35s
+
+# 从独立文件注入敏感变量；前置 - 表示文件不存在时不报错
+EnvironmentFile=-/opt/nms-agent/env
+
+# 安全加固（root 运行时无需 AmbientCapabilities）
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# ProtectSystem=strict 将文件系统设为只读；运行时需要写入的目录必须在此列出
+ReadWritePaths=/opt/nms-agent/logs /opt/nms-agent/.certs
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now nms-agent
+```
+
+---
+
+### 方式二：专用账户（生产推荐）
+
+独立账户 + FHS 标准路径，配合最小权限原则。
+
+**创建系统账户**
+
+```bash
+useradd -r -s /sbin/nologin -d /var/lib/nms-agent -m nms-agent
+```
+
+**安装文件**
+
+```bash
+install -o root -g root -m 755 nms-agent /usr/local/bin/nms-agent
+
+mkdir -p /etc/nms-agent
+install -o root -g nms-agent -m 640 configs/config.yaml /etc/nms-agent/config.yaml
+
+mkdir -p /var/log/nms-agent && chown nms-agent:nms-agent /var/log/nms-agent
+mkdir -p /var/lib/nms-agent/.certs && chown -R nms-agent:nms-agent /var/lib/nms-agent
+```
+
+**注入 provisioning token**
+
+```bash
+tee /etc/nms-agent/env > /dev/null <<'EOF'
+NMS_TOKEN=your-one-time-provisioning-token
+EOF
+chmod 600 /etc/nms-agent/env
+```
+
+**config.yaml 使用绝对路径**
 
 ```yaml
 server:
-  provisioning_token: "${NMS_TOKEN}"        # 从 EnvironmentFile 展开
+  provisioning_token: "${NMS_TOKEN}"
 
 runtime:
   log:
@@ -378,10 +453,10 @@ certs:
   dir: "/var/lib/nms-agent/.certs"
 ```
 
-### 5. 创建 unit 文件
+**unit 文件**
 
 ```bash
-sudo tee /etc/systemd/system/nms-agent.service > /dev/null <<'EOF'
+tee /etc/systemd/system/nms-agent.service > /dev/null <<'EOF'
 [Unit]
 Description=NMS Agent — network probe edge node
 Documentation=https://github.com/Cion-1221/NMS_Agent
@@ -395,24 +470,18 @@ Group=nms-agent
 ExecStart=/usr/local/bin/nms-agent -config /etc/nms-agent/config.yaml
 Restart=on-failure
 RestartSec=10s
-# 略长于 config.yaml 的 grace_period（30s），确保 Agent 完成优雅停机后
-# systemd 再强制终止，而不是抢先发出 SIGKILL。
 TimeoutStopSec=35s
 
-# 从独立文件注入敏感环境变量；前置 - 表示文件不存在时不报错
 EnvironmentFile=-/etc/nms-agent/env
 
-# ping / traceroute 需要 CAP_NET_RAW；Ambient Capabilities 仅授予此能力，
-# 不以 root 运行整个进程。
+# 非 root 账户需要 CAP_NET_RAW 才能使用 ping / traceroute 的原始套接字
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
 
-# 安全加固
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# 运行时需要写入的目录须在此明确列出（ProtectSystem=strict 默认只读）
 ReadWritePaths=/var/log/nms-agent /var/lib/nms-agent
 
 [Install]
@@ -420,28 +489,33 @@ WantedBy=multi-user.target
 EOF
 ```
 
-### 6. 启用并启动
-
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now nms-agent
+systemctl daemon-reload
+systemctl enable --now nms-agent
 ```
+
+---
 
 ### 常用管理命令
 
 ```bash
-sudo systemctl status nms-agent          # 运行状态
-sudo systemctl restart nms-agent         # 重启（修改配置后执行）
-sudo systemctl stop nms-agent            # 停止
+systemctl status nms-agent          # 运行状态
+systemctl restart nms-agent         # 重启（修改配置后执行）
+systemctl stop nms-agent            # 停止
 
-# 实时跟踪 journald 日志
-sudo journalctl -u nms-agent -f
-
-# 或直接查看 lumberjack 管理的滚动日志文件
-sudo tail -f /var/log/nms-agent/nms-agent.log
+journalctl -u nms-agent -f          # 实时跟踪 journald 日志
+tail -f /opt/nms-agent/logs/nms-agent.log   # 或直接查看滚动日志文件
 ```
 
-> **提示**：首次 enrollment 成功后（日志出现 `enrollment successful`），可将 `/etc/nms-agent/env` 中的 `NMS_TOKEN` 行删除或置空——之后凭 mTLS 证书鉴权，provisioning token 不再使用。
+### 常见启动失败原因
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `status=1/FAILURE`，日志提示权限错误 | `ProtectSystem=strict` 开启但 `ReadWritePaths` 未配置，Agent 无法写日志或证书 | 在 unit 文件中正确填写 `ReadWritePaths`，列出所有需要写入的目录 |
+| 证书/日志路径不存在 | 未设 `WorkingDirectory`，config.yaml 中的相对路径被解析到 `/` 下 | 添加 `WorkingDirectory=<安装目录>` 或在 config.yaml 中改用绝对路径 |
+| enrollment 报 `x509: certificate signed by unknown authority` | enroll 端点使用了系统不信任的证书（自签名或私有 CA） | 在 config.yaml 中设置 `insecure_enroll: true`，enrollment 成功后可改回 `false` |
+
+> **提示**：首次 enrollment 成功后（日志出现 `enrollment successful`），可将 `env` 文件中的 `NMS_TOKEN` 行删除——之后凭 mTLS 证书鉴权，provisioning token 不再使用。
 
 ## 平台限制
 
