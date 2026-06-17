@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
@@ -27,11 +26,17 @@ func runTCPPing(ctx context.Context, task Task, sourceIP string) []Result {
 func doTCPPing(ctx context.Context, taskID int, target, sourceIP string) Result {
 	r := Result{TaskID: taskID, Type: "tcpping", Target: target}
 
-	// Accept both "ip:port" and bare "ip" (defaults to port 80).
-	addr := target
-	if !strings.Contains(target, ":") {
-		addr = target + ":80"
+	// Normalise the target into host:port form that net.Dial accepts.
+	// net.SplitHostPort correctly handles IPv6 literals in [addr]:port form.
+	// A bare address (no port, including raw IPv6 like "2001:db8::1") causes
+	// SplitHostPort to fail, so we fall back to port 80 and use JoinHostPort
+	// which adds the required brackets for IPv6: "[2001:db8::1]:80".
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+		port = "80"
 	}
+	addr := net.JoinHostPort(host, port)
 
 	// Source IP binding: LocalAddr pins the outgoing TCP SYN to a specific interface.
 	var localAddr net.Addr

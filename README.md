@@ -16,6 +16,7 @@
 - [配置说明](#配置说明)
 - [证书工作流](#证书工作流)
 - [Source IP 绑定](#source-ip-绑定)
+- [双栈支持（IPv4/IPv6）](#双栈支持ipv4ipv6)
 - [安全设计](#安全设计)
 - [构建与发布](#构建与发布)
 - [平台限制](#平台限制)
@@ -27,7 +28,8 @@
 - **mTLS 双向认证**：首次启动时用一次性 provisioning token 向服务端申请证书，后续所有通信（任务拉取、结果上传、证书续签）走互相验证的 mTLS 通道。
 - **证书热更新**：mTLS 客户端使用 `GetClientCertificate` 回调，续签后的证书在下一次 TLS 握手时即时生效，无需重启。
 - **证书自动续签**：后台 goroutine 每日检查证书有效期，剩余不足 30 天时自动调用 `POST /api/v1/agent-sync/renew-cert` 续签。
-- **Source IP 绑定**：服务端可为每个 Agent 指定出站源 IP，所有探测的发包 socket 均绑定到该地址，确保流量从指定网卡出站。源 IP 变更时探测 goroutine 自动重启，立即生效。
+- **Source IP 绑定**：服务端可为每个 Agent 指定出站源 IP（IPv4 或 IPv6），所有探测的发包 socket 均绑定到该地址，确保流量从指定网卡出站。源 IP 变更时探测 goroutine 自动重启，立即生效。
+- **全协议双栈**：ping、tcpping、httpcheck、dnscheck、traceroute、mtr 均原生支持 IPv4 和 IPv6 目标，无需额外配置。
 - **批量上报**：探测结果写入内存队列，按批次大小或刷新间隔批量 POST 到服务端，避免高频小请求。
 - **优雅停机**：捕获 `SIGINT`/`SIGTERM`，等待正在执行的探测和上传在宽限期内完成后退出。
 - **跨平台静态编译**：纯 Go + `CGO_ENABLED=0`，单一代码库交叉编译出 Linux / Windows / macOS（amd64 与 arm64）六个平台的静态二进制。
@@ -111,17 +113,18 @@ NMS_Agent/
 
 所有探测类型均由服务端在任务列表中指定，本地配置中不声明。
 
-| type 字段 | 协议 / 工具 | Source IP 绑定方式 | Linux | Windows | macOS |
-|-----------|------------|-------------------|:-----:|:-------:|:-----:|
-| `ping` / `meshping` | ICMP（pro-bing） | `pinger.Source` | ✅ | ✅* | ✅ |
-| `tcpping` | TCP | `net.Dialer.LocalAddr` | ✅ | ✅ | ✅ |
-| `httpcheck` | HTTP(S) | `Transport.DialContext` | ✅ | ✅ | ✅ |
-| `dnscheck` | DNS UDP | `net.Resolver` UDP bind | ✅ | ✅ | ✅ |
-| `traceroute` | 原始 ICMP | `icmp.ListenPacket(addr)` | ✅ | ❌† | ✅ |
-| `mtr` | `mtr` 二进制 | `--address` 参数 | ✅ | ❌† | ✅ |
+| type 字段 | 协议 / 工具 | IPv4 | IPv6 | Linux | Windows | macOS |
+|-----------|------------|:----:|:----:|:-----:|:-------:|:-----:|
+| `ping` / `meshping` | ICMP（pro-bing） | ✅ | ✅ | ✅ | ✅* | ✅ |
+| `tcpping` | TCP | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `httpcheck` | HTTP(S) | ✅ | ✅† | ✅ | ✅ | ✅ |
+| `dnscheck` | DNS UDP | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `traceroute` | 原始 ICMP | ✅ | ✅ | ✅ | ❌‡ | ✅ |
+| `mtr` | `mtr` 二进制 | ✅ | ✅ | ✅ | ❌‡ | ✅ |
 
 \* Windows 下 ICMP ping 通常需要管理员权限或放行防火墙。  
-† Windows 上 traceroute 和 mtr 任务会返回明确的不支持错误结果，不会导致 Agent 崩溃。
+† httpcheck 的 IPv6 目标 URL 须使用 RFC 3986 括号格式：`http://[2001:db8::1]/path`。  
+‡ Windows 上 traceroute 和 mtr 任务返回明确的不支持错误结果，不会导致 Agent 崩溃。
 
 ## 快速开始
 
@@ -233,19 +236,56 @@ certs:
 
 ## Source IP 绑定
 
-服务端在任务响应中携带 `source_ip` 字段（可为空）。Agent 将其传递给所有探测函数，各协议的绑定方式如下：
+服务端在任务响应中携带 `source_ip` 字段（可为空，支持 IPv4 或 IPv6）。Agent 将其传递给所有探测函数，各协议的绑定方式如下：
 
 | 协议 | 绑定实现 |
 |------|---------|
 | ICMP（ping） | `pinger.Source = sourceIP` |
-| TCP（tcpping / httpcheck） | `net.Dialer{LocalAddr: &net.TCPAddr{IP: ...}}` |
-| DNS（dnscheck） | `net.Resolver{Dial: func() { net.Dialer{LocalAddr: &net.UDPAddr{...}} }}` |
+| TCP（tcpping / httpcheck） | `net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP(sourceIP)}}` |
+| DNS（dnscheck） | `net.Resolver{Dial: func() { net.Dialer{LocalAddr: &net.UDPAddr{IP: ...}} }}` |
 | 原始 ICMP（traceroute） | `icmp.ListenPacket(network, sourceIP)` |
 | mtr | `mtr --address sourceIP` |
 
 `source_ip` 为空时各探测使用操作系统默认路由出站接口，行为与普通工具一致。
 
 服务端下发的 `source_ip` 变更（包括从有值变为空或反之）会触发所有探测 goroutine 立即重启，在同一个调和周期内以新地址重建连接。
+
+**地址族约束**：`source_ip` 与探测目标必须属于同一地址族。IPv4 源地址配合 IPv6 目标（或反之）会导致 socket 绑定失败；服务端在下发任务时应保证两者一致。
+
+## 双栈支持（IPv4/IPv6）
+
+所有探测均原生支持 IPv4 和 IPv6，无需额外配置开关。各协议的实现细节：
+
+**ping / meshping**  
+`pro-bing` 对目标地址执行 `Resolve()` 后，依据解析结果自动选择 ICMPv4 或 ICMPv6。目标可填 IPv4 字面地址、IPv6 字面地址或域名（域名同时有 A/AAAA 记录时由操作系统决策优先级）。
+
+**tcpping**  
+使用 `net.SplitHostPort` + `net.JoinHostPort` 解析目标，正确处理所有格式：
+
+| 输入格式 | 解析结果 |
+|----------|---------|
+| `192.168.1.1` | → `192.168.1.1:80` |
+| `192.168.1.1:8080` | → `192.168.1.1:8080` |
+| `2001:db8::1`（裸 IPv6） | → `[2001:db8::1]:80` |
+| `[2001:db8::1]:8080` | → `[2001:db8::1]:8080` |
+
+**httpcheck**  
+使用标准库 `net/http`，原生支持 IPv6。IPv6 字面地址在 URL 中须遵循 RFC 3986 括号格式：
+
+```
+http://[2001:db8::1]/path        ✅
+https://[2001:db8::1]:8443/api   ✅
+http://2001:db8::1/path          ❌ 不合法，stdlib 解析失败
+```
+
+**dnscheck**  
+`net.Resolver.LookupIPAddr` 同时返回 A（IPv4）和 AAAA（IPv6）记录，结果中的第一个地址记入 `detail` 字段。DNS 查询通过绑定了 `source_ip` 的 UDP socket 发出，支持 IPv4 和 IPv6 上游 DNS 服务器。
+
+**traceroute**  
+代码内部按目标地址族分叉：IPv4 目标走 `ip4:icmp`（ICMPv4 Echo + TTL），IPv6 目标走 `ip6:ipv6-icmp`（ICMPv6 EchoRequest + HopLimit）。Source IP 通过 `icmp.ListenPacket(network, sourceIP)` 绑定，对两个地址族均有效。
+
+**mtr**  
+`mtr` 二进制本身支持双栈，目标为 IPv6 地址时自动使用 ICMPv6。`--address` 参数接受 IPv4 或 IPv6 源地址。
 
 ## 安全设计
 
