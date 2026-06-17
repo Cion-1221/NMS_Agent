@@ -105,6 +105,10 @@ func main() {
 		return
 	}
 
+	// Ignore SIGHUP so the agent survives SSH session disconnects and terminal
+	// detaches. Graceful shutdown is handled by SIGINT and SIGTERM only.
+	signal.Ignore(syscall.SIGHUP)
+
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		slog.Error("config load failed", "err", err, "path", *cfgPath)
