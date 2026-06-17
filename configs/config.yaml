@@ -1,309 +1,64 @@
-# ==============================================================================
-# NMS-Agent 配置文件
-# 设计原则：所有运行时行为均由本文件驱动，代码中不允许出现硬编码业务参数。
-# 支持通过环境变量覆盖敏感字段，写法为 ${ENV_VAR_NAME}（由 viper + EnvKeyReplacer 解析）。
-# ==============================================================================
+# ============================================================================
+# NMS Agent Bootstrap Configuration
+#
+# This is the minimal config needed to enroll and run the agent.
+# Sensitive values support ${ENV_VAR} expansion — prefer environment variables
+# over plain-text secrets in this file.
+# ============================================================================
 
-# ------------------------------------------------------------------------------
-# Agent 基础信息：标识当前 Agent 在分布式拓扑中的身份
-# ------------------------------------------------------------------------------
 agent:
-  id: "agent-hkg1-001"          # 全局唯一 Agent ID，建议 = site + 序号
-  site: "HKG1"                  # 所在机房/节点简称，必须与 mesh_peers 中其他 Agent 引用本机的名字一致
-  region: "ap-east-1"           # 所在地理区域，用于上层做区域聚合
-  tags:                         # 任意附加标签，随每条上报数据一起携带
+  # id: leave empty on first boot; the server assigns one during enrollment.
+  # After enrollment the agent reads its ID from .certs/agent_id.
+  id: ""
+  region: "HKG"
+  tags:
+    role: "edge"
+    datacenter: "DC1"
     provider: "equinix"
-    env: "production"
-    tier: "edge"
-  hostname_override: ""         # 留空则使用系统 hostname
+  # hostname_override: if empty the agent uses os.Hostname() during enrollment.
+  hostname_override: ""
 
-# ------------------------------------------------------------------------------
-# 运行时通用参数
-# ------------------------------------------------------------------------------
-runtime:
-  log_level: "info"             # debug | info | warn | error
-  log_format: "json"            # json | text
-  log_output: "stdout"          # stdout | file
-  log_file_path: "/var/log/nms-agent/agent.log"
-  shutdown_grace_period: "15s"  # SIGINT/SIGTERM 后等待所有模块退出的最长时间
-  max_module_concurrency: 32    # 全局并发执行的模块任务上限（防止极端配置打满本机资源）
-  panic_recovery: true          # 子模块 panic 是否被 recover（生产环境必须为 true）
-
-# ------------------------------------------------------------------------------
-# 中心 NMS Server 上报配置
-# ------------------------------------------------------------------------------
 server:
-  report_url: "https://nms.example.com/api/v1/agent/report"
-  auth_token: "${NMS_AGENT_TOKEN}"      # 建议通过环境变量注入，不要写入明文提交到仓库
-  protocol: "http"                       # http | grpc（grpc 为预留扩展位）
-  request_timeout: "10s"
-  batch_size: 200                        # 攒批上限，达到后立即 flush
-  flush_interval: "5s"                   # 攒批时间上限，超时强制 flush
-  queue_capacity: 5000                   # 上报内存队列容量，超出后按 drop_oldest 策略丢弃并计数告警
-  tls:
-    insecure_skip_verify: false
-    ca_cert_path: ""
-    client_cert_path: ""
-    client_key_path: ""
-  retry:
-    max_retries: 3
-    initial_backoff: "1s"
-    max_backoff: "30s"
-    backoff_multiplier: 2.0
+  # enroll_url: single-way HTTPS endpoint used once on first boot.
+  enroll_url: "https://nms.example.com:8443"
+  # report_url: mTLS sync endpoint for task polling and result upload.
+  report_url: "https://nms.example.com:8444"
+  # provisioning_token: one-time token obtained from the NMS admin UI.
+  # After the agent enrolls and receives its certificate, this field is
+  # no longer used and can be left empty or removed.
+  provisioning_token: "${NMS_TOKEN}"
+  # insecure_enroll: set true only if the enroll endpoint uses a self-signed
+  # certificate that the agent cannot verify during its first connection.
+  # The mTLS sync channel always performs full certificate verification.
+  insecure_enroll: false
+  # task_poll_interval: how often to fetch the task list from the server.
+  task_poll_interval: "30s"
+  # flush_interval: maximum time between result upload batches.
+  flush_interval: "30s"
+  # batch_size: upload a batch as soon as this many results are buffered.
+  batch_size: 100
+  # request_timeout: HTTP request timeout for both task fetch and result upload.
+  request_timeout: "30s"
 
-# ------------------------------------------------------------------------------
-# 功能模块配置（15 个模块，全部支持 enabled 开关）
-# ------------------------------------------------------------------------------
-modules:
+runtime:
+  log:
+    # file: path to the log file; leave empty to write to stderr.
+    file: "logs/nms-agent.log"
+    # max_size_mb: rotate when the file reaches this size (lumberjack).
+    max_size_mb: 100
+    # max_age_days: delete rotated files older than this many days.
+    max_age_days: 30
+    # max_backups: keep at most this many rotated log files.
+    max_backups: 30
+    # compress: gzip-compress rotated files.
+    compress: true
+  # grace_period: time to wait for in-flight probes and uploads to finish
+  # after receiving SIGINT/SIGTERM.
+  grace_period: "30s"
+  # max_concurrency: maximum number of probe executions running concurrently.
+  max_concurrency: 20
 
-  # ============ 一、网络主动探测 ============
-
-  ping:
-    enabled: true
-    interval: "30s"
-    timeout: "2s"
-    packet_count: 4
-    privileged: false           # true=原始ICMP socket(需root/管理员或CAP_NET_RAW); false=非特权UDP/ICMP datagram
-    targets:
-      - name: "google-dns"
-        address: "8.8.8.8"
-      - name: "cloudflare-dns"
-        address: "1.1.1.1"
-      - name: "core-gateway"
-        address: "10.0.0.1"
-
-  tcp_ping:
-    enabled: true
-    interval: "30s"
-    timeout: "2s"
-    targets:
-      - name: "core-switch-ssh"
-        address: "10.0.0.1:22"
-      - name: "app-server-https"
-        address: "10.1.0.5:443"
-
-  http_check:
-    enabled: true
-    interval: "60s"
-    timeout: "5s"
-    targets:
-      - name: "company-portal"
-        url: "https://portal.example.com/health"
-        method: "GET"
-        expect_status: 200
-        expect_keyword: "\"status\":\"ok\""
-        headers:
-          User-Agent: "nms-agent-httpcheck/1.0"
-        skip_tls_verify: false
-
-  dns_check:
-    enabled: true
-    interval: "60s"
-    timeout: "3s"
-    resolver: "8.8.8.8:53"
-    queries:
-      - domain: "www.example.com"
-        record_type: "A"
-        expect_contains: ""        # 留空表示只校验"能否解析成功"
-
-  traceroute:
-    enabled: false
-    interval: "300s"
-    max_hops: 30
-    timeout: "2s"
-    probes_per_hop: 3
-    targets:
-      - name: "upstream-isp-a"
-        address: "203.0.113.1"
-
-  mtr:
-    enabled: false
-    interval: "300s"
-    cycles: 10                   # 每轮对每一跳发送的探测次数
-    timeout: "1s"
-    max_hops: 30
-    targets:
-      - name: "upstream-isp-a"
-        address: "203.0.113.1"
-
-  speedtest:
-    enabled: false
-    interval: "3600s"
-    server_id: ""                 # 留空=自动选择延迟最低的 Ookla 测速服务器
-    save_history: true
-    history_path: "/var/lib/nms-agent/speedtest_history.json"
-
-  # ============ 二、Mesh 延迟矩阵（Looking Glass）============
-
-  mesh_ping:
-    enabled: true
-    interval: "15s"
-    timeout: "2s"
-    packet_count: 5
-    privileged: false
-    concurrency: 10               # 同时探测的 peer 数量上限（worker pool 大小）
-    self_name: "HKG1"             # 必须与 agent.site 保持一致，作为上报数据中的 source
-    peers:
-      - name: "SGN1"
-        address: "203.0.113.10"
-      - name: "NRT1"
-        address: "203.0.113.20"
-      - name: "FRA1"
-        address: "203.0.113.30"
-      - name: "IAD1"
-        address: "203.0.113.40"
-      - name: "SJC1"
-        address: "203.0.113.50"
-
-  # ============ 三、网络设备监控 ============
-
-  snmp_poll:
-    enabled: true
-    interval: "60s"
-    timeout: "5s"
-    retries: 1
-    devices:
-      - name: "core-switch-01"
-        address: "10.0.0.1"
-        port: 161
-        version: "v2c"             # v1 | v2c | v3
-        community: "public"
-        oids:
-          - name: "sysUpTime"
-            oid: "1.3.6.1.2.1.1.3.0"
-          - name: "sysDescr"
-            oid: "1.3.6.1.2.1.1.1.0"
-          - name: "cpuUsage"
-            oid: "1.3.6.1.4.1.9.9.109.1.1.1.1.5.1"
-      - name: "core-router-01"
-        address: "10.0.0.2"
-        port: 161
-        version: "v3"
-        v3:
-          username: "nmsuser"
-          security_level: "authPriv"   # noAuthNoPriv | authNoPriv | authPriv
-          auth_protocol: "SHA"
-          auth_key: "${SNMP_V3_AUTH_KEY}"
-          priv_protocol: "AES"
-          priv_key: "${SNMP_V3_PRIV_KEY}"
-        oids:
-          - name: "sysUpTime"
-            oid: "1.3.6.1.2.1.1.3.0"
-
-  interface_discovery:
-    enabled: true
-    interval: "600s"               # 拓扑变化不频繁，默认10分钟一次全量发现
-    timeout: "10s"
-    devices:
-      - name: "core-switch-01"
-        address: "10.0.0.1"
-        version: "v2c"
-        community: "public"
-
-  netflow:
-    enabled: false
-    mode: "receiver"               # receiver=本地监听采集 | forwarder=收到后转发到上游采集器
-    listen_address: "0.0.0.0:2055"
-    protocol: "netflow_v9"         # netflow_v5 | netflow_v9 | ipfix | sflow
-    forward_to: ""                 # mode=forwarder 时的上游地址，如 "10.9.0.5:2055"
-    sample_rate_hint: 1            # 配合上游设备的采样率换算真实流量
-
-  bgp_check:
-    enabled: false
-    interval: "60s"
-    method: "snmp"                  # snmp | ssh
-    peers:
-      - name: "isp-peer-a"
-        device_address: "10.0.0.2"
-        peer_ip: "203.0.113.1"
-        expect_state: "established"
-    snmp:
-      community: "public"
-      version: "v2c"
-    ssh:
-      username: "netops"
-      auth_method: "key"            # key | password
-      private_key_path: "/etc/nms-agent/keys/id_rsa"
-      password: "${BGP_SSH_PASSWORD}"
-      vendor: "huawei"               # huawei | cisco | juniper，决定命令与输出解析模板
-
-  # ============ 四、运维执行类 ============
-
-  config_backup:
-    enabled: true
-    interval: "86400s"               # 默认每天一次
-    timeout: "30s"
-    storage_path: "/var/lib/nms-agent/backups"
-    retention_days: 30
-    devices:
-      - name: "core-switch-01"
-        address: "10.0.0.1"
-        port: 22
-        username: "netops"
-        auth_method: "key"           # key | password
-        private_key_path: "/etc/nms-agent/keys/id_rsa"
-        password: "${DEVICE_SSH_PASSWORD}"
-        vendor: "huawei"
-        backup_command: "display current-configuration"
-
-  script_engine:
-    enabled: true
-    work_dir: "/var/lib/nms-agent/scripts"
-    default_timeout: "60s"
-    allowed_interpreters:            # 不在白名单内的解释器一律拒绝执行
-      - "python3"
-      - "bash"
-    scripts:
-      - name: "disk-cleanup"
-        enabled: true
-        interpreter: "bash"
-        path: "scripts/disk_cleanup.sh"
-        cron: "0 3 * * *"             # 标准 5 段 cron 表达式，由内部 cron 解析器调度
-        args: []
-        timeout: "120s"
-      - name: "interface-stat-collect"
-        enabled: false
-        interpreter: "python3"
-        path: "scripts/iface_stat.py"
-        cron: "*/10 * * * *"
-        args: ["--format", "json"]
-        timeout: "30s"
-
-  remote_command:
-    enabled: true
-    listen_mode: "poll"              # poll=主动轮询中心取指令 | grpc=被动接收流式指令（预留）
-    poll_interval: "10s"
-    command_source_url: "https://nms.example.com/api/v1/agents/{agent_id}/commands"
-    result_callback_url: "https://nms.example.com/api/v1/agents/{agent_id}/command_results"
-    execution_timeout: "30s"
-    max_concurrent_commands: 3
-    # 安全基线：默认拒绝一切命令，只有匹配白名单（且不匹配黑名单）才允许执行
-    whitelist:
-      - "^systemctl status [a-zA-Z0-9_\\-\\.]+$"
-      - "^ping -c [0-9]{1,2} [a-zA-Z0-9\\.\\-]+$"
-      - "^show version$"
-      - "^display current-configuration$"
-    blacklist:
-      - "rm -rf"
-      - "shutdown"
-      - "reboot"
-      - "mkfs"
-      - ":(){ :|:& };:"               # fork bomb
-    require_confirmation_for:         # 命中即使在白名单内，也需要中心侧二次确认令牌才能执行
-      - "^interface .* shutdown$"
-      - "^undo .*"
-
-  # ============ 五、日志类 ============
-
-  syslog:
-    enabled: true
-    listen_address: "0.0.0.0:514"
-    protocol: "udp"                   # udp | tcp
-    forward_to: "https://nms.example.com/api/v1/syslog/ingest"
-    buffer_size: 4096
-    parse_format: "auto"              # auto | rfc3164 | rfc5424
-    local_storage:
-      enabled: true
-      path: "/var/log/nms-agent/syslog"
-      max_size_mb: 500
-      max_backups: 7
+certs:
+  # dir: directory where mTLS credentials are stored after enrollment.
+  # Contains: ca.crt, client.crt, client.key, agent_id
+  dir: ".certs"

@@ -1,16 +1,12 @@
 module github.com/Cion-1221/NMS_Agent
 
-go 1.26.4
+go 1.25.0
 
 require (
-	github.com/gosnmp/gosnmp v1.43.2
 	github.com/prometheus-community/pro-bing v0.9.0
-	github.com/robfig/cron/v3 v3.0.1
-	github.com/showwin/speedtest-go v1.7.10
 	github.com/spf13/viper v1.21.0
-	golang.org/x/crypto v0.53.0
 	golang.org/x/net v0.56.0
-	gopkg.in/mcuadros/go-syslog.v2 v2.3.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (

@@ -1,112 +1,195 @@
-// Package scheduler 把启用的功能模块编排为独立 goroutine 并发运行。
-//
-// 设计要点：
-//  1. 每个模块拥有自己的 goroutine 与 ticker，互不阻塞、互不影响执行节奏；
-//  2. 每次 Module.Run 调用都被 recover 包裹——单个模块 panic 只会记录一条日志，
-//     绝不会向上传播导致整个 Agent 进程退出；
-//  3. 所有调度均挂在同一个 context 下，SIGINT/SIGTERM 触发取消后，
-//     所有 goroutine 在各自当前迭代结束后退出，实现优雅停机；
-//  4. 用带缓冲的 semaphore 限制全局同时执行的模块数量
-//     （对应 config.yaml 的 runtime.max_module_concurrency），
-//     防止配置了大量 target 的探测类模块在同一时刻打满本机 CPU/连接数/文件描述符。
+// Package scheduler pulls task definitions from the NMS server and manages
+// per-task probe goroutines, reconciling additions and removals on each poll.
 package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
-	"runtime/debug"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/Cion-1221/NMS_Agent/internal/module"
+	"github.com/Cion-1221/NMS_Agent/internal/config"
+	"github.com/Cion-1221/NMS_Agent/internal/probe"
+	"github.com/Cion-1221/NMS_Agent/internal/reporter"
 )
 
-// Task 把一个模块实例与它的执行周期绑定在一起。
-// Interval <= 0 且模块未实现 module.Emitter 时，按"启动时执行一次"处理；
-// Interval <= 0 且模块实现了 module.Emitter 时，按"常驻 daemon"处理。
-type Task struct {
-	Module   module.Module
-	Interval time.Duration
+// taskResponse mirrors the JSON returned by GET /api/v1/agent-sync/tasks.
+type taskResponse struct {
+	AgentID  string       `json:"agent_id"`
+	SourceIP string       `json:"source_ip"` // empty means OS picks source
+	Tasks    []probe.Task `json:"tasks"`
 }
 
-// Sink 是调度器产出结果的去向，由 internal/reporter.Reporter 实现。
-type Sink interface {
-	Enqueue(results []module.Result)
+// taskRunner tracks a running per-task goroutine so it can be cancelled
+// when the server removes the task from the list.
+type taskRunner struct {
+	task   probe.Task
+	cancel context.CancelFunc
 }
 
+// Scheduler fetches tasks via mTLS, keeps them reconciled, and dispatches
+// probes with a shared concurrency semaphore.
 type Scheduler struct {
-	logger *slog.Logger
-	sink   Sink
-	sem    chan struct{}
+	client   *http.Client
+	syncURL  string
+	reporter *reporter.Reporter
+	cfg      config.ServerConfig
+	sem      chan struct{}
+
+	mu       sync.RWMutex
+	sourceIP string // last source_ip from server; read by probe goroutines
 }
 
-func New(logger *slog.Logger, sink Sink, maxConcurrency int) *Scheduler {
+func New(client *http.Client, syncURL string, rep *reporter.Reporter, cfg config.ServerConfig, maxConcurrency int) *Scheduler {
 	if maxConcurrency <= 0 {
-		maxConcurrency = 1
+		maxConcurrency = 20
 	}
 	return &Scheduler{
-		logger: logger,
-		sink:   sink,
-		sem:    make(chan struct{}, maxConcurrency),
+		client:   client,
+		syncURL:  syncURL,
+		reporter: rep,
+		cfg:      cfg,
+		sem:      make(chan struct{}, maxConcurrency),
 	}
 }
 
-// Run 为每个 Task 启动一个调度 goroutine，阻塞直到 ctx 被取消且所有
-// goroutine 均已退出。调用方（main.go）通常会把它放进 errgroup 或单独的 goroutine。
-func (s *Scheduler) Run(ctx context.Context, tasks []Task) {
-	var wg sync.WaitGroup
-	for _, t := range tasks {
-		t := t
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.dispatch(ctx, t)
-		}()
-	}
-	wg.Wait()
-	s.logger.Info("scheduler stopped: all module goroutines exited")
-}
-
-func (s *Scheduler) dispatch(ctx context.Context, t Task) {
-	name := t.Module.Name()
-
-	if t.Interval <= 0 {
-		if emitter, ok := t.Module.(module.Emitter); ok {
-			s.runDaemon(ctx, name, emitter)
-			return
+// Run polls the server for tasks on each TaskPollInterval tick and reconciles
+// the set of running probe goroutines. Blocks until ctx is cancelled.
+func (s *Scheduler) Run(ctx context.Context) {
+	runners := make(map[int]*taskRunner)
+	defer func() {
+		for _, r := range runners {
+			r.cancel()
 		}
-		s.logger.Info("module has no interval and is not an Emitter, running once", "module", name)
-		s.execute(ctx, t.Module)
-		return
-	}
+	}()
 
-	s.runTicker(ctx, name, t)
-}
+	// Fetch immediately on startup so the agent starts probing right away.
+	s.reconcile(ctx, runners)
 
-// runTicker 是绝大多数周期性模块（ping/snmp_poll/mesh_ping/...）的调度主循环。
-func (s *Scheduler) runTicker(ctx context.Context, name string, t Task) {
-	s.logger.Info("module scheduled", "module", name, "interval", t.Interval)
-
-	ticker := time.NewTicker(t.Interval)
+	ticker := time.NewTicker(s.cfg.TaskPollInterval)
 	defer ticker.Stop()
-
-	// 启动后立即执行一次，不必等待第一个 tick，缩短首次数据上报的延迟。
-	s.execute(ctx, t.Module)
 
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("module stopping (context cancelled)", "module", name)
 			return
 		case <-ticker.C:
-			s.execute(ctx, t.Module)
+			s.reconcile(ctx, runners)
 		}
 	}
 }
 
-// execute 在并发配额内安全地执行一次 Module.Run，是 panic 隔离的第一道屏障。
-func (s *Scheduler) execute(ctx context.Context, m module.Module) {
+// reconcile fetches the current task list from the server and starts/stops
+// probe goroutines to match. If source_ip changes all runners are cancelled
+// and restarted so their sockets bind to the new interface immediately.
+func (s *Scheduler) reconcile(ctx context.Context, runners map[int]*taskRunner) {
+	tasks, sourceIP, err := s.fetchTasks(ctx)
+	if err != nil {
+		slog.Error("scheduler: task fetch failed", "err", err)
+		return
+	}
+
+	s.mu.Lock()
+	prevSourceIP := s.sourceIP
+	s.sourceIP = sourceIP
+	s.mu.Unlock()
+
+	if prevSourceIP != sourceIP {
+		slog.Info("scheduler: source_ip changed — restarting all probe goroutines",
+			"old", prevSourceIP, "new", sourceIP)
+		for id, r := range runners {
+			r.cancel()
+			delete(runners, id)
+		}
+	}
+
+	wanted := make(map[int]probe.Task, len(tasks))
+	for _, t := range tasks {
+		wanted[t.TaskID] = t
+	}
+
+	// Cancel goroutines for tasks that the server no longer returns.
+	for id, r := range runners {
+		if _, ok := wanted[id]; !ok {
+			r.cancel()
+			delete(runners, id)
+			slog.Info("scheduler: task removed", "task_id", id)
+		}
+	}
+
+	// Start goroutines for newly-added tasks.
+	for _, t := range tasks {
+		if _, exists := runners[t.TaskID]; !exists {
+			taskCtx, cancel := context.WithCancel(ctx)
+			runners[t.TaskID] = &taskRunner{task: t, cancel: cancel}
+			go s.runTask(taskCtx, t)
+			slog.Info("scheduler: task started",
+				"task_id", t.TaskID, "type", t.Type, "interval_s", t.IntervalSeconds)
+		}
+	}
+
+	slog.Debug("scheduler: reconciled",
+		"running_tasks", len(runners), "source_ip", sourceIP)
+}
+
+func (s *Scheduler) fetchTasks(ctx context.Context) ([]probe.Task, string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
+	defer cancel()
+
+	url := strings.TrimRight(s.syncURL, "/") + "/api/v1/agent-sync/tasks"
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "", err
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("GET /tasks: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("GET /tasks: HTTP %d", resp.StatusCode)
+	}
+
+	var tr taskResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		return nil, "", fmt.Errorf("decode task response: %w", err)
+	}
+	return tr.Tasks, tr.SourceIP, nil
+}
+
+// runTask ticks at the task's configured interval and calls execute on each tick.
+// The task runs once immediately on startup so results arrive before the first
+// interval elapses.
+func (s *Scheduler) runTask(ctx context.Context, task probe.Task) {
+	interval := time.Duration(task.IntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+
+	s.execute(ctx, task) // run immediately
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.execute(ctx, task)
+		}
+	}
+}
+
+// execute acquires a slot from the concurrency semaphore, reads the current
+// source IP, runs the probe, and feeds results to the reporter.
+func (s *Scheduler) execute(ctx context.Context, task probe.Task) {
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
@@ -114,86 +197,12 @@ func (s *Scheduler) execute(ctx context.Context, m module.Module) {
 	}
 	defer func() { <-s.sem }()
 
-	defer func() {
-		if r := recover(); r != nil {
-			s.logger.Error("module panic recovered",
-				"module", m.Name(),
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()))
-		}
-	}()
+	s.mu.RLock()
+	sourceIP := s.sourceIP
+	s.mu.RUnlock()
 
-	start := time.Now()
-	results, err := m.Run(ctx)
-	elapsed := time.Since(start)
-
-	if err != nil {
-		s.logger.Warn("module run returned error", "module", m.Name(), "error", err, "elapsed", elapsed)
-		return
+	results := probe.Dispatch(ctx, task, sourceIP)
+	for _, r := range results {
+		s.reporter.Enqueue(r)
 	}
-	if len(results) == 0 {
-		return
-	}
-	s.logger.Debug("module run produced results", "module", m.Name(), "count", len(results), "elapsed", elapsed)
-	s.sink.Enqueue(results)
-}
-
-// runDaemon 启动常驻模块（Syslog 监听、Netflow 接收器等），并在其异常退出后
-// 按指数退避自动重启，直到 ctx 被取消——单次网络抖动或 panic 不应让采集通道永久失效。
-func (s *Scheduler) runDaemon(ctx context.Context, name string, e module.Emitter) {
-	const (
-		initialBackoff = time.Second
-		maxBackoff     = 30 * time.Second
-	)
-	backoff := initialBackoff
-
-	emit := func(results ...module.Result) {
-		if len(results) == 0 {
-			return
-		}
-		s.sink.Enqueue(results)
-	}
-
-	s.logger.Info("daemon module starting", "module", name)
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		err := s.serveOnce(ctx, e, emit)
-
-		if ctx.Err() != nil {
-			s.logger.Info("daemon module stopped (context cancelled)", "module", name)
-			return
-		}
-		if err != nil {
-			s.logger.Error("daemon module exited unexpectedly, restarting",
-				"module", name, "error", err, "backoff", backoff)
-		} else {
-			s.logger.Warn("daemon module returned without error, restarting", "module", name, "backoff", backoff)
-		}
-
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return
-		}
-		if backoff < maxBackoff {
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-		}
-	}
-}
-
-// serveOnce 是 panic 隔离的第二道屏障，专门保护 Emitter.Serve 这种长生命周期调用。
-func (s *Scheduler) serveOnce(ctx context.Context, e module.Emitter, emit func(...module.Result)) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
-		}
-	}()
-	return e.Serve(ctx, emit)
 }

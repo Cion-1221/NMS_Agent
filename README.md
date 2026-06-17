@@ -1,9 +1,9 @@
 # NMS Agent
 
-部署在分布式边缘节点（机房 / POP）上的网络管理 Agent：纯配置驱动，周期性采集网络状态、轮询设备、执行运维动作，并将结果统一上报回中心 NMS Server。内置全球节点间的网状延迟探测（MeshPing），为 Looking Glass 延迟矩阵提供数据源。
+部署在分布式边缘节点（机房 / POP）上的网络探测 Agent。启动后自动向 NMS Server 申请 mTLS 证书，随后持续轮询服务端下发的探测任务（ping、tcpping、httpcheck、dnscheck、traceroute、mtr），将结果批量上传回服务端。所有探测目标、探测类型、执行周期均由服务端动态下发，本地配置只需填写身份信息和服务端地址。
 
 [![Build and Release](https://github.com/Cion-1221/NMS_Agent/actions/workflows/release.yml/badge.svg)](https://github.com/Cion-1221/NMS_Agent/actions/workflows/release.yml)
-![Go Version](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go)
+![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)
 ![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20windows%20%7C%20macOS-lightgrey)
 
 ## 目录
@@ -11,144 +11,138 @@
 - [核心特性](#核心特性)
 - [架构设计](#架构设计)
 - [目录结构](#目录结构)
-- [功能模块一览](#功能模块一览)
+- [探测类型](#探测类型)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
-- [Looking Glass 延迟矩阵（MeshPing）](#looking-glass-延迟矩阵meshping)
-- [安全基线](#安全基线)
+- [证书工作流](#证书工作流)
+- [Source IP 绑定](#source-ip-绑定)
+- [安全设计](#安全设计)
 - [构建与发布](#构建与发布)
-- [开发指南](#开发指南)
-- [已知限制与路线图](#已知限制与路线图)
+- [平台限制](#平台限制)
 - [License](#license)
 
 ## 核心特性
 
-- **纯配置驱动**：所有行为——模块开关、执行周期、目标列表、鉴权信息——都来自 [`configs/config.yaml`](configs/config.yaml)，代码中不出现硬编码业务参数。敏感字段（Token、密钥、密码）支持 `${ENV_VAR}` 占位符，启动时从环境变量展开，不需要写进配置文件明文。
-- **高并发**：每个模块独立 goroutine 调度，模块内部按需使用 worker pool（如 MeshPing）/ 并发 fan-out（如 Ping、SNMP）探测多个目标，互不阻塞。
-- **故障隔离**：任何模块的 `panic` 都会被 Scheduler 逐层 `recover`，不会波及其他模块或整个进程；常驻型模块（Syslog、NetFlow、Script Engine）异常退出后按指数退避（1s→2s→4s→…→30s 封顶）自动重启。
-- **优雅停机**：捕获 `SIGINT`/`SIGTERM`，通过统一的 `context.Context` 通知所有模块与上报队列在限定的 `shutdown_grace_period` 内收尾，超时则强制退出而不是无限期挂起。
-- **开箱即用的安全基线**：远程命令执行模块默认拒绝一切命令，必须命中白名单正则且不命中黑名单才会执行；高危操作还可要求中心侧二次确认令牌。
-- **跨平台**：纯 Go + `CGO_ENABLED=0`，单一代码库交叉编译出 Linux / Windows / macOS（amd64 与 arm64）六个平台的静态二进制。
+- **服务端驱动**：探测目标、类型、周期全部由服务端 `GET /api/v1/agent-sync/tasks` 下发；本地配置仅含身份信息与服务端地址，无需重启即可调整探测策略。
+- **mTLS 双向认证**：首次启动时用一次性 provisioning token 向服务端申请证书，后续所有通信（任务拉取、结果上传、证书续签）走互相验证的 mTLS 通道。
+- **证书热更新**：mTLS 客户端使用 `GetClientCertificate` 回调，续签后的证书在下一次 TLS 握手时即时生效，无需重启。
+- **证书自动续签**：后台 goroutine 每日检查证书有效期，剩余不足 30 天时自动调用 `POST /api/v1/agent-sync/renew-cert` 续签。
+- **Source IP 绑定**：服务端可为每个 Agent 指定出站源 IP，所有探测的发包 socket 均绑定到该地址，确保流量从指定网卡出站。源 IP 变更时探测 goroutine 自动重启，立即生效。
+- **批量上报**：探测结果写入内存队列，按批次大小或刷新间隔批量 POST 到服务端，避免高频小请求。
+- **优雅停机**：捕获 `SIGINT`/`SIGTERM`，等待正在执行的探测和上传在宽限期内完成后退出。
+- **跨平台静态编译**：纯 Go + `CGO_ENABLED=0`，单一代码库交叉编译出 Linux / Windows / macOS（amd64 与 arm64）六个平台的静态二进制。
 
 ## 架构设计
 
 ```
-                         ┌───────────────────────┐
-                         │     configs/config.yaml │
-                         └───────────┬────────────┘
-                                     │ viper.Load
-                                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ main.go                                                          │
-│  · 加载配置 / 初始化 slog / 注册 SIGINT・SIGTERM → ctx            │
-│  · buildTasks(): 按 enabled=true 实例化各模块，组装 scheduler.Task │
-└───────────────────────────┬───────────────────────────────────────┘
-                             │
-              ┌──────────────┴───────────────┐
-              ▼                               ▼
-   ┌─────────────────────┐         ┌─────────────────────────┐
-   │ scheduler.Scheduler  │         │ reporter.Reporter         │
-   │ 每个模块一个 goroutine │  Result │ 攒批(BatchSize/Flush      │
-   │ ticker 周期触发 Run() │ ------> │ Interval) -> HTTP POST    │
-   │ 或常驻调度 Serve()    │  channel│ 重试 + 指数退避            │
-   │ panic recover 兜底    │         └────────────┬─────────────┘
-   └──────────┬────────────┘                      │
-              │ module.Module / module.Emitter     ▼
-              ▼                          ┌────────────────────┐
-   ┌────────────────────────┐            │   中心 NMS Server    │
-   │ 15 + 1 个功能模块        │            └────────────────────┘
-   │ ping / snmp_poll / ...  │
-   │ mesh_ping（核心焦点）    │
-   └─────────────────────────┘
+  ┌──────────────────────────────────────────────────────┐
+  │                    NMS Server                         │
+  │                                                        │
+  │  :8443  POST /api/v1/agents/enroll  (一次性，单向 TLS) │
+  │  :8444  GET  /api/v1/agent-sync/tasks        (mTLS)   │
+  │  :8444  POST /api/v1/agent-sync/results      (mTLS)   │
+  │  :8444  POST /api/v1/agent-sync/renew-cert   (mTLS)   │
+  └────────────────────┬─────────────────────────────────┘
+                        │
+              mTLS + X-Agent-Version header
+                        │
+  ┌─────────────────────▼─────────────────────────────────┐
+  │  main.go                                               │
+  │   1. 加载 configs/config.yaml                          │
+  │   2. 证书检查 → 首次 enroll → 初始化 mTLS 客户端        │
+  │   3. 启动 cert renewal goroutine（每日检查）             │
+  │   4. 启动 Reporter + Scheduler                         │
+  └──────┬──────────────────────────────┬─────────────────┘
+         │                              │
+  ┌──────▼──────────┐         ┌─────────▼──────────────┐
+  │   Scheduler      │         │      Reporter           │
+  │ 每隔 poll_interval│ probe   │ 内存队列攒批            │
+  │ 拉取任务，diff 式 │ Results │ 按批次大小 / 刷新间隔   │
+  │ 管理 probe 协程  │ ──────> │ POST /results           │
+  └──────┬──────────┘         └────────────────────────┘
+         │  并发信号量（max_concurrency）
+  ┌──────▼──────────────────────────────────────────────┐
+  │  internal/probe/                                     │
+  │   probe.go     — Dispatch() 路由到对应实现            │
+  │   ping.go      — ICMP（pro-bing，source IP 绑定）     │
+  │   tcpping.go   — TCP 拨号（net.Dialer.LocalAddr）    │
+  │   httpcheck.go — HTTP(S)（Transport.DialContext）    │
+  │   dnscheck.go  — DNS（net.Resolver，UDP bind）       │
+  │   traceroute.go— 原始 ICMP 套接字（Linux/macOS）     │
+  │   mtr.go       — 调用系统 mtr 二进制（Linux/macOS）  │
+  └─────────────────────────────────────────────────────┘
 ```
 
-整个程序只依赖两个接口（[`internal/module/module.go`](internal/module/module.go)）：
-
-| 接口 | 适用场景 | Scheduler 调度方式 |
-|------|----------|---------------------|
-| `Module`（`Run(ctx) ([]Result, error)`） | 周期性任务：Ping、SNMP、HTTP Check… | 按 `interval` 起 `time.Ticker` 反复调用 |
-| `Emitter`（`Serve(ctx, emit)`，组合 `Module`） | 常驻监听/调度：Syslog、NetFlow、Script Engine | 常驻 goroutine，异常退出指数退避自动重启 |
-
-`Scheduler`/`Reporter` 完全不知道 Ping、SNMP 这些具体业务模块的存在——新增一个功能模块只需要实现上述接口并在 [`main.go`](main.go) 的 `buildTasks` 里补一行装配代码，不需要改动框架代码。
+**任务调和逻辑**：`Scheduler` 维护一个 `map[taskID]*taskRunner`。每次从服务端拉取任务后，取消服务端已移除的任务对应的 goroutine，为新增任务启动 goroutine，已有任务保持不变（不重启）。若服务端返回的 `source_ip` 发生变化，则取消所有运行中的 goroutine，在同一轮调和中重新启动，以使新的 IP 绑定立即生效。
 
 ## 目录结构
 
 ```
 NMS_Agent/
 ├── go.mod / go.sum
-├── main.go                              # 入口：配置加载/日志/信号/模块装配
+├── main.go                       # 入口：配置 / 证书 / mTLS 客户端 / 启动
 ├── configs/
-│   └── config.yaml                      # 唯一的行为来源
+│   └── config.yaml               # Bootstrap 配置（4 个顶级块）
+├── .certs/                       # 证书目录（运行时生成，不提交版本库）
+│   ├── ca.crt                    # 服务端 CA 证书
+│   ├── client.crt                # Agent 客户端证书
+│   ├── client.key                # Agent 私钥（权限 0600）
+│   └── agent_id                  # 服务端分配的 AgentID
+├── logs/                         # 日志目录（运行时生成）
 ├── .github/workflows/
-│   └── release.yml                      # 打 Tag 自动交叉编译并发布 Release
+│   └── release.yml               # 打 Tag 自动交叉编译并发布 Release
 └── internal/
-    ├── module/module.go                 # Module / Emitter 接口、Result、Identity
-    ├── config/config.go                 # viper 加载 + 全量配置结构体 + Validate
-    ├── logger/logger.go                 # slog 初始化（json/text，stdout/文件）
-    ├── scheduler/scheduler.go           # goroutine 调度、panic 隔离、daemon 退避重启
-    ├── reporter/reporter.go             # 攒批 + HTTP POST + 重试退避
-    ├── probe/                           # 一、网络主动探测
-    │   ├── ping/                        #   ICMP Ping（pro-bing）
-    │   ├── tcpping/                     #   TCP 端口可达性
-    │   ├── httpcheck/                   #   HTTP(S) 健康检查
-    │   ├── dnscheck/                    #   DNS 解析探测
-    │   ├── traceroute/                  #   IPv4 TTL 递增路由探测（x/net/icmp）
-    │   ├── mtr/                         #   逐跳丢包/延迟统计（调用系统 mtr）
-    │   ├── speedtest/                   #   带宽测速（speedtest-go）
-    │   └── meshping/                    #   ★ 核心焦点：Looking Glass 矩阵数据源
-    ├── netmon/                          # 二、网络设备监控
-    │   ├── snmpclient/                  #   共享：SNMP v1/v2c/v3 客户端构造
-    │   ├── snmppoll/                    #   按 OID 列表周期 GET
-    │   ├── ifdiscovery/                 #   walk IF-MIB::ifTable 发现接口
-    │   ├── netflow/                     #   NetFlow/sFlow 接收器或转发器
-    │   └── bgpcheck/                    #   BGP Peer 状态（SNMP / SSH）
-    ├── ops/                             # 三、运维执行类
-    │   ├── configbackup/                #   SSH 拉取设备配置并落盘
-    │   ├── scriptengine/                #   按 cron 执行本地脚本（robfig/cron）
-    │   └── remotecmd/                   #   远程命令执行（白名单/黑名单/二次确认）
-    └── logcollect/
-        └── syslog/                      # 四、Syslog 接收与转发
+    ├── cert/cert.go              # 证书生命周期：enroll / expiry / renew / mTLS 客户端
+    ├── config/config.go          # viper 加载 + 配置结构体
+    ├── logger/logger.go          # slog JSON 日志 + lumberjack 文件轮转
+    ├── probe/                    # 所有探测实现（同一个 package）
+    │   ├── probe.go              #   Dispatch()：task type → 实现路由
+    │   ├── ping.go               #   ICMP Ping
+    │   ├── tcpping.go            #   TCP 端口可达性
+    │   ├── httpcheck.go          #   HTTP(S) 健康检查
+    │   ├── dnscheck.go           #   DNS 解析探测
+    │   ├── traceroute.go         #   逐跳路由追踪
+    │   └── mtr.go                #   MTR（调用系统二进制）
+    ├── reporter/reporter.go      # 攒批 + HTTP POST 到 /results
+    └── scheduler/scheduler.go   # 任务拉取 + diff 式协程管理
 ```
 
-## 功能模块一览
+## 探测类型
 
-| 模块 | config.yaml 键 | 默认 enabled | 推荐第三方库 | 调度方式 |
-|------|-----------------|:---:|--------------|----------|
-| Ping | `ping` | ✅ | `prometheus-community/pro-bing` | 周期 |
-| TCP Ping | `tcp_ping` | ✅ | 标准库 `net` | 周期 |
-| HTTP Check | `http_check` | ✅ | 标准库 `net/http` | 周期 |
-| DNS Check | `dns_check` | ✅ | 标准库 `net` | 周期 |
-| Traceroute | `traceroute` | ❌ | `golang.org/x/net/icmp` + `ipv4` | 周期 |
-| MTR | `mtr` | ❌ | 系统 `mtr` 二进制（`--report --json`） | 周期 |
-| Speedtest | `speedtest` | ❌ | `showwin/speedtest-go` | 周期 |
-| **MeshPing** | `mesh_ping` | ✅ | `prometheus-community/pro-bing` | 周期（worker pool） |
-| SNMP Polling | `snmp_poll` | ✅ | `gosnmp/gosnmp` | 周期 |
-| Interface Discovery | `interface_discovery` | ✅ | `gosnmp/gosnmp`（walk IF-MIB） | 周期 |
-| NetFlow/sFlow | `netflow` | ❌ | 自带 v5 头解析；v9/IPFIX/sFlow 建议接 `netsampler/goflow2` | 常驻（Emitter） |
-| BGP Check | `bgp_check` | ❌ | SNMP 走 `gosnmp`（BGP4-MIB）；SSH 走 `x/crypto/ssh` | 周期 |
-| Config Backup | `config_backup` | ✅ | `golang.org/x/crypto/ssh` | 周期 |
-| Script Engine | `script_engine` | ✅ | `robfig/cron/v3` | 常驻（Emitter） |
-| Remote Command | `remote_command` | ✅ | 标准库 `os/exec` + `regexp` | 周期（轮询） |
-| Syslog | `syslog` | ✅ | `mcuadros/go-syslog.v2` | 常驻（Emitter） |
+所有探测类型均由服务端在任务列表中指定，本地配置中不声明。
 
-完整字段含义见 [配置说明](#配置说明) 与 [`configs/config.yaml`](configs/config.yaml) 内的逐行注释。
+| type 字段 | 协议 / 工具 | Source IP 绑定方式 | Linux | Windows | macOS |
+|-----------|------------|-------------------|:-----:|:-------:|:-----:|
+| `ping` / `meshping` | ICMP（pro-bing） | `pinger.Source` | ✅ | ✅* | ✅ |
+| `tcpping` | TCP | `net.Dialer.LocalAddr` | ✅ | ✅ | ✅ |
+| `httpcheck` | HTTP(S) | `Transport.DialContext` | ✅ | ✅ | ✅ |
+| `dnscheck` | DNS UDP | `net.Resolver` UDP bind | ✅ | ✅ | ✅ |
+| `traceroute` | 原始 ICMP | `icmp.ListenPacket(addr)` | ✅ | ❌† | ✅ |
+| `mtr` | `mtr` 二进制 | `--address` 参数 | ✅ | ❌† | ✅ |
+
+\* Windows 下 ICMP ping 通常需要管理员权限或放行防火墙。  
+† Windows 上 traceroute 和 mtr 任务会返回明确的不支持错误结果，不会导致 Agent 崩溃。
 
 ## 快速开始
 
 ### 方式一：下载预编译二进制
 
-从 [Releases](https://github.com/Cion-1221/NMS_Agent/releases) 下载对应平台的压缩包（命名规则 `nms-agent_<version>_<os>_<arch>.{tar.gz|zip}`），解压后内含二进制、示例配置与 README：
+从 [Releases](https://github.com/Cion-1221/NMS_Agent/releases) 下载对应平台的压缩包（`nms-agent_<version>_<os>_<arch>.{tar.gz|zip}`），解压后内含二进制、示例配置与 README：
 
 ```bash
 tar -xzf nms-agent_1.0.0_linux_amd64.tar.gz
 cd nms-agent_1.0.0_linux_amd64
-vim configs/config.yaml        # 按需修改 agent.id / site / server.report_url 等
+
+# 编辑配置：填写 enroll_url、report_url、provisioning_token
+vim configs/config.yaml
+
+# 首次运行自动 enroll，获取证书后进入正常运行模式
 ./nms-agent -config configs/config.yaml
 ```
 
 ### 方式二：从源码构建
 
-要求 Go 1.26 及以上。
+要求 Go 1.25 及以上。
 
 ```bash
 git clone https://github.com/Cion-1221/NMS_Agent.git
@@ -157,122 +151,145 @@ go build -o nms-agent .
 ./nms-agent -config configs/config.yaml
 ```
 
-```bash
-./nms-agent -version     # 查看版本/commit/构建时间
-./nms-agent -config /etc/nms-agent/config.yaml
+### 命令行参数
+
+```
+nms-agent -config <path>   指定配置文件路径（默认 configs/config.yaml）
+nms-agent -version         打印版本 / commit / 构建时间后退出
 ```
 
-### 验证
+### 验证启动
 
-成功启动后会以 JSON 结构化日志输出已装配的模块列表；按 `Ctrl+C`（或 `kill -TERM <pid>`）触发优雅停机，会看到 `shutdown signal received` 与 `all modules stopped cleanly` 日志。
+成功启动后会输出 JSON 结构化日志：
+
+```json
+{"time":"...","level":"INFO","msg":"nms-agent starting","version":"1.0.0","region":"HKG"}
+{"time":"...","level":"INFO","msg":"enrolling with NMS server","enroll_url":"https://..."}
+{"time":"...","level":"INFO","msg":"enrollment successful — certificates saved","agent_id":"agent-abc123"}
+{"time":"...","level":"INFO","msg":"scheduler: task started","task_id":1,"type":"ping","interval_s":30}
+```
+
+按 `Ctrl+C`（或 `kill -TERM <pid>`）触发优雅停机。
 
 ## 配置说明
 
-完整示例见 [`configs/config.yaml`](configs/config.yaml)，分为四大块：
+完整示例见 [`configs/config.yaml`](configs/config.yaml)，分为四个顶级块：
 
 ```yaml
-agent:    # Agent 身份：id / site（机房名）/ region / tags
-runtime:  # 进程级参数：日志格式与级别、并发上限、停机等待时长
-server:   # 上报地址、鉴权 Token、TLS、重试策略
-modules:  # 15 + 1 个功能模块各自的 enabled / interval / 业务参数
+agent:
+  id: ""                        # 留空；enrollment 后从 .certs/agent_id 读取
+  region: "HKG"                 # 区域标识，随结果一并上报
+  tags:
+    role: "edge"
+    datacenter: "DC1"
+  hostname_override: ""         # 留空时使用 os.Hostname()
+
+server:
+  enroll_url: "https://nms.example.com:8443"    # 单向 TLS，仅首次 enroll 使用
+  report_url: "https://nms.example.com:8444"    # mTLS，任务拉取 + 结果上传
+  provisioning_token: "${NMS_TOKEN}"            # 一次性 token，enroll 后可清空
+  insecure_enroll: false        # 仅在 enroll 端点使用自签名证书时设 true
+  task_poll_interval: "30s"     # 拉取任务列表的间隔
+  flush_interval: "30s"         # 结果上传的最大等待时间
+  batch_size: 100               # 攒够此数量立即上传（不等 flush_interval）
+  request_timeout: "30s"        # 单次 HTTP 请求超时
+
+runtime:
+  log:
+    file: "logs/nms-agent.log"  # 留空则输出到 stderr
+    max_size_mb: 100            # 按大小轮转
+    max_age_days: 30            # 保留天数
+    max_backups: 30             # 保留文件数
+    compress: true              # gzip 压缩旧日志
+  grace_period: "30s"           # SIGTERM 后等待探测/上传完成的最长时间
+  max_concurrency: 20           # 同时执行的探测任务上限
+
+certs:
+  dir: ".certs"                 # 证书存放目录（含 ca.crt / client.crt / client.key / agent_id）
 ```
 
-**敏感信息处理**：`server.auth_token`、SNMPv3 密钥、SSH 密码等字段支持写成 `${ENV_VAR}` 占位符，[`internal/config/config.go`](internal/config/config.go) 在加载时用 `os.ExpandEnv` 展开，真正的值通过环境变量（如 systemd 的 `EnvironmentFile=`，或 `.env` + 进程管理器）注入，配置文件本身可以安全提交到版本库。
+**敏感信息处理**：`provisioning_token` 等字段支持 `${ENV_VAR}` 占位符，在启动时从环境变量展开，配置文件本身可安全提交版本库。推荐通过 systemd `EnvironmentFile=` 或容器 Secret 注入。
 
-**模块开关**：每个模块块都有 `enabled: true/false`；大部分模块还有 `interval`（如 `30s`）。`netflow` / `script_engine` / `syslog` 三个常驻模块没有 `interval` 字段——它们不是"定期触发一次"，而是持续监听/调度。
+## 证书工作流
 
-## Looking Glass 延迟矩阵（MeshPing）
+```
+首次启动
+  └─ .certs/ 不存在或不完整
+       └─ POST /api/v1/agents/enroll（单向 HTTPS，带 provisioning_token）
+            └─ 写入 ca.crt、client.crt、client.key（0600）、agent_id
+               └─ 初始化 mTLS 客户端，进入正常运行
 
-前端需要的是一张 N×N 的全球节点延迟交叉矩阵，但**单个 Agent 只能产出矩阵里"以自己为 source"的那一整行**——它既不可能、也不需要知道其它任意两个 peer 之间的延迟。完整矩阵由 NMS Server 把所有 N 个 Agent 各自上报的边，按 `(source, destination)` 拼接、去重后聚合出来。
+后续启动
+  └─ .certs/ 存在
+       └─ 读取 agent_id，直接初始化 mTLS 客户端
 
-配置（`modules.mesh_ping`）：
-
-```yaml
-mesh_ping:
-  enabled: true
-  interval: "15s"
-  concurrency: 10        # worker pool 大小，避免瞬间打出大量 ICMP 自我拥塞
-  self_name: "HKG1"      # 必须等于 agent.site，否则启动时 Validate 直接报错拒绝启动
-  peers:
-    - name: "SGN1"
-      address: "203.0.113.10"
-    - name: "NRT1"
-      address: "203.0.113.20"
+证书热更新（运行中）
+  ├─ 后台 goroutine 每 24h 检查 client.crt 有效期
+  ├─ 剩余 < 30 天 → POST /api/v1/agent-sync/renew-cert（mTLS）
+  │    └─ 服务端返回新 cert/key，覆盖写入磁盘
+  └─ 下一次 TLS 握手自动加载新证书（GetClientCertificate 回调）
+       └─ 无需重启 Agent
 ```
 
-每轮探测产出的上报数据形如：
+## Source IP 绑定
 
-```json
-{
-  "module": "mesh_ping",
-  "agent_id": "agent-hkg1-001",
-  "site": "HKG1",
-  "data": {
-    "source": "HKG1",
-    "destination": "SGN1",
-    "latency_ms": 45.2,
-    "loss_rate": 0,
-    "reachable": true
-  }
-}
-```
+服务端在任务响应中携带 `source_ip` 字段（可为空）。Agent 将其传递给所有探测函数，各协议的绑定方式如下：
 
-服务端把所有机房的 Agent 上报的这类边收集起来，即可拼出完整矩阵；前端按 `source` 取行、`destination` 取列渲染交叉表即可。核心实现见 [`internal/probe/meshping/meshping.go`](internal/probe/meshping/meshping.go)。
+| 协议 | 绑定实现 |
+|------|---------|
+| ICMP（ping） | `pinger.Source = sourceIP` |
+| TCP（tcpping / httpcheck） | `net.Dialer{LocalAddr: &net.TCPAddr{IP: ...}}` |
+| DNS（dnscheck） | `net.Resolver{Dial: func() { net.Dialer{LocalAddr: &net.UDPAddr{...}} }}` |
+| 原始 ICMP（traceroute） | `icmp.ListenPacket(network, sourceIP)` |
+| mtr | `mtr --address sourceIP` |
 
-## 安全基线
+`source_ip` 为空时各探测使用操作系统默认路由出站接口，行为与普通工具一致。
 
-- **远程命令执行**（`modules.remote_command`）默认拒绝一切命令：必须命中 `whitelist` 中的某条正则，且不命中 `blacklist` 任意一条，命令才会被执行；命中 `require_confirmation_for` 的命令即使在白名单内也会被挂起为 `pending_confirmation`，等待中心侧签发的 `confirmation_token`。
-- **脚本引擎**（`modules.script_engine`）只会执行 `allowed_interpreters` 白名单内的解释器，配置里出现白名单之外的解释器会被直接拒绝并记录日志，而不是静默忽略。
-- **密钥管理**：见上文「配置说明」的 `${ENV_VAR}` 展开机制，避免明文密钥提交进版本库。
-- **已知待加强项**（详见下方路线图）：SSH 相关模块（`config_backup`、`bgp_check` 的 SSH 路径）目前用 `ssh.InsecureIgnoreHostKey()` 跳过主机指纹校验，便于跑通骨架；生产部署前必须替换为校验设备指纹的 `FixedHostKey`。
+服务端下发的 `source_ip` 变更（包括从有值变为空或反之）会触发所有探测 goroutine 立即重启，在同一个调和周期内以新地址重建连接。
+
+## 安全设计
+
+- **双向 mTLS**：任务拉取、结果上传、证书续签均走 mTLS 通道。服务端 CA 签发 Agent 证书，Agent 信任服务端 CA；双方互相验证，任意一方证书失效即连接拒绝。
+- **`X-Agent-Version` 请求头**：所有 mTLS 请求都注入该头（值为编译时 `-ldflags` 写入的版本号），供服务端记录 Agent 软件版本，无需额外鉴权字段。
+- **证书文件权限**：私钥 `client.key` 写入权限为 `0600`；`certs.dir` 目录权限为 `0700`。
+- **insecure_enroll 仅限首次**：`insecure_enroll: true` 只影响 enroll 端点（端口 8443）的 TLS 验证，mTLS 同步通道（端口 8444）始终执行完整证书验证，不受该选项影响。
+- **provisioning_token 一次性**：Enroll 成功后该 token 即失效；配置中可将其清空或删除，后续所有连接凭证书鉴权。
 
 ## 构建与发布
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `v*` 标签时自动执行三个阶段：
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `v*` Tag 时自动执行：
 
-1. **verify**：`go mod tidy && go vet ./... && go test ./...`，只跑一次。
-2. **build**：矩阵交叉编译 `{linux, windows, darwin} × {amd64, arm64}` 共 6 个目标。全部基于 `CGO_ENABLED=0` 的纯 Go 静态编译，因此不需要真实的 Windows/macOS 机器，单个 `ubuntu-latest` runner 即可完成全部平台的产出；通过 `-ldflags "-X main.version=... -X main.commit=... -X main.buildDate=..."` 把版本信息编译进二进制（对应 [`main.go`](main.go) 里的 `version`/`commit`/`buildDate` 变量,可用 `-version` 查看)。每个平台打包成 `nms-agent_<version>_<os>_<arch>.{tar.gz|zip}`，内含二进制、`README.md` 与示例 `configs/config.yaml`。
-3. **release**：汇总全部产物，生成 `SHA256SUMS.txt` 校验文件，按上一个 Tag 到当前 Tag 之间的 commit 自动生成 Changelog，调用 `softprops/action-gh-release` 发布 GitHub Release。
+1. **verify**：`go mod tidy && go vet ./... && go test ./...`，只跑一次（不重复跑 6 遍）。
+2. **build**：矩阵交叉编译 `{linux, windows, darwin} × {amd64, arm64}` 共 6 个目标，均基于 `CGO_ENABLED=0` 纯 Go 静态编译，全部在单个 `ubuntu-latest` runner 上完成。通过 `-ldflags` 写入 `version`/`commit`/`buildDate`，可用 `-version` 查看。每个目标打包成含二进制 + `configs/config.yaml` + `README.md` 的压缩包。
+3. **release**：汇总产物，生成 `SHA256SUMS.txt`，按 Tag 间 commit 自动生成 Changelog，调用 `softprops/action-gh-release` 发布。
 
-也支持手动触发（Actions 页面 `Run workflow`，不依赖 Tag）跑完整的编译矩阵验证是否能跨平台编译通过，但不会创建 Release（仅 Tag 推送才会执行发布阶段）。
+`workflow_dispatch` 可手动触发完整编译矩阵做预验证，不会创建 Release。
 
-发布一个新版本：
+发布新版本：
 
 ```bash
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-本地手动交叉编译（示例：Linux arm64）：
+本地交叉编译示例（Linux arm64）：
 
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o nms-agent_linux_arm64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -trimpath -ldflags "-s -w -X main.version=1.0.0" -o nms-agent_linux_arm64 .
 ```
 
-## 开发指南
+## 平台限制
 
-新增一个功能模块的标准步骤：
+| 功能 | Linux | macOS | Windows |
+|------|:-----:|:-----:|:-------:|
+| ping / tcpping / httpcheck / dnscheck | ✅ | ✅ | ✅ |
+| traceroute | ✅（需 root 或 `CAP_NET_RAW`） | ✅（需 sudo） | ❌ 返回明确错误 |
+| mtr | ✅（需安装 `mtr-tiny`） | ✅（需安装 `mtr`） | ❌ 返回明确错误 |
+| 日志文件轮转 | ✅ | ✅ | ✅ |
 
-1. 在 `internal/<group>/<modulename>/` 下新建包，定义该模块的 `Stat`/结果结构体；
-2. 实现 `Name() string` 与 `Run(ctx context.Context) ([]module.Result, error)`（常驻型模块改为实现 `Serve(ctx, emit)`，参考 [`internal/logcollect/syslog`](internal/logcollect/syslog/syslog.go)）；
-3. 在 [`internal/config/config.go`](internal/config/config.go) 的 `ModulesConfig` 里补一个对应的配置结构体，并在 [`configs/config.yaml`](configs/config.yaml) 补上默认配置块；
-4. 在 [`main.go`](main.go) 的 `buildTasks` 里补一行 `if m.XXX.Enabled { tasks = append(...) }`。
-
-Scheduler、Reporter 不需要任何改动。
-
-代码规范：`gofmt`/`go vet` 必须通过（CI 会强制检查）；模块间公共逻辑（如 SNMP 客户端构造）下沉到 `internal/netmon/snmpclient` 这类共享包，避免重复实现。
-
-## 已知限制与路线图
-
-诚实列出当前骨架里有意保留为 TODO、而不是伪造成"已完成"的部分：
-
-- `bgp_check` 的 SSH 路径只搭好了登录取回原始输出的骨架，厂商命令输出解析器 `vendorParsers` 是空注册表——不同厂商 CLI 格式差异很大，需要真实设备输出样本才能补全；SNMP 路径（BGP4-MIB）是完整实现。
-- `netflow` 只对 NetFlow v5 定长包头做了真实解析；v9/IPFIX/sFlow 是模板型可变长格式，需要接入 `netsampler/goflow2` 的解码链。
-- `mtr` 依赖系统 `mtr`/`mtr-tiny` 二进制（Linux 发行版自带或需手动安装），Windows 节点应将该模块设为 `enabled: false`。
-- `server.protocol: grpc` 目前只是预留字段，Reporter 只实现了 HTTP POST 上报。
-- 尚未补充单元测试（CI 中的 `go test ./...` 目前等价于占位检查）。
-- SSH 相关模块的主机指纹校验（见「安全基线」一节）。
+traceroute 和 mtr 在 Windows 上不可用时，Agent 不会崩溃——对应任务会返回说明性错误结果并上报给服务端，其他探测任务继续正常运行。
 
 ## License
 
-本项目尚未指定开源许可证。如需对外开源发布，请补充 `LICENSE` 文件；当前默认仅限 CION 内部使用。
+本项目尚未指定开源许可证。当前仅限 CION 内部使用；如需对外开源，请补充 `LICENSE` 文件。

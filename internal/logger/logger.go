@@ -1,77 +1,77 @@
-// Package logger 基于标准库 log/slog 构建全局结构化日志。
-// 选择 slog 而非第三方库（zap/zerolog）：Go 1.21+ 标准库已自带，
-// 减少依赖面，且性能足以应对 Agent 这种 IO 为主的工作负载。
+// Package logger sets up a JSON slog logger backed by lumberjack with optional
+// daily log-file rotation.
 package logger
 
 import (
-	"fmt"
+	"context"
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
-	"strings"
+	"time"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 
 	"github.com/Cion-1221/NMS_Agent/internal/config"
 )
 
-// New 依据 runtime 配置构建 *slog.Logger，并将其设置为 slog 默认 logger。
-// 返回的 closeFunc 用于进程退出前 flush/关闭日志文件句柄（stdout 场景下是 no-op），
-// main.go 应在 defer 中调用它。
-func New(cfg config.RuntimeConfig) (logger *slog.Logger, closeFunc func(), err error) {
-	output, closeFunc, err := resolveOutput(cfg)
-	if err != nil {
-		return nil, func() {}, err
+// New creates a JSON slog logger.
+//
+// Returns:
+//   - *slog.Logger  — use for structured logging throughout the agent
+//   - func(context.Context) — call once after the main context is ready to
+//     start daily log-file rotation (no-op when logging to stderr)
+//   - func() — call on process exit to flush and close the underlying file
+func New(cfg config.LogConfig) (*slog.Logger, func(context.Context), func()) {
+	var w io.Writer
+	var lj *lumberjack.Logger
+
+	if cfg.File != "" {
+		lj = &lumberjack.Logger{
+			Filename:   cfg.File,
+			MaxSize:    cfg.MaxSizeMB,  // megabytes before rotation
+			MaxAge:     cfg.MaxAgeDays, // days to retain rotated files
+			MaxBackups: cfg.MaxBackups, // number of old files to keep
+			Compress:   cfg.Compress,
+			LocalTime:  true,
+		}
+		w = lj
+	} else {
+		w = os.Stderr
 	}
 
-	handlerOpts := &slog.HandlerOptions{
-		Level:     parseLevel(cfg.LogLevel),
-		AddSource: cfg.LogLevel == "debug",
+	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo})
+	log := slog.New(h)
+	slog.SetDefault(log)
+
+	startRotation := func(ctx context.Context) {
+		if lj == nil {
+			return
+		}
+		go dailyRotate(ctx, lj)
 	}
 
-	var handler slog.Handler
-	switch strings.ToLower(cfg.LogFormat) {
-	case "text":
-		handler = slog.NewTextHandler(output, handlerOpts)
-	default:
-		handler = slog.NewJSONHandler(output, handlerOpts)
-	}
-
-	logger = slog.New(handler)
-	slog.SetDefault(logger)
-	return logger, closeFunc, nil
-}
-
-func parseLevel(level string) slog.Level {
-	switch strings.ToLower(level) {
-	case "debug":
-		return slog.LevelDebug
-	case "warn", "warning":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
-}
-
-func resolveOutput(cfg config.RuntimeConfig) (io.Writer, func(), error) {
-	if strings.ToLower(cfg.LogOutput) != "file" {
-		return os.Stdout, func() {}, nil
-	}
-
-	if cfg.LogFilePath == "" {
-		return nil, nil, fmt.Errorf("logger: log_output=file but log_file_path is empty")
-	}
-	if dir := filepath.Dir(cfg.LogFilePath); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, nil, fmt.Errorf("logger: create log dir %s: %w", dir, err)
+	closeFunc := func() {
+		if lj != nil {
+			_ = lj.Close()
 		}
 	}
 
-	f, err := os.OpenFile(cfg.LogFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, nil, fmt.Errorf("logger: open log file %s: %w", cfg.LogFilePath, err)
-	}
+	return log, startRotation, closeFunc
+}
 
-	return f, func() { _ = f.Close() }, nil
+// dailyRotate triggers lj.Rotate() at local midnight on each calendar day,
+// ensuring log files roll over regardless of file-size limits.
+func dailyRotate(ctx context.Context, lj *lumberjack.Logger) {
+	for {
+		now := time.Now().Local()
+		next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			_ = lj.Rotate()
+		}
+	}
 }
