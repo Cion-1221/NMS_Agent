@@ -41,7 +41,7 @@ func init() {
 	mtrBinary, _ = exec.LookPath("mtr")
 }
 
-func runMTR(ctx context.Context, task Task, sourceIP string) []Result {
+func runMTR(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
 	results := make([]Result, len(task.Targets))
 	var wg sync.WaitGroup
 	for i, target := range task.Targets {
@@ -49,14 +49,14 @@ func runMTR(ctx context.Context, task Task, sourceIP string) []Result {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doMTR(ctx, task.TaskID, target, sourceIP)
+			results[i] = doMTR(ctx, task.TaskID, target, sourceIPv4, sourceIPv6)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doMTR(ctx context.Context, taskID int, target, sourceIP string) Result {
+func doMTR(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6 string) Result {
 	r := Result{TaskID: taskID, Type: "mtr", Target: target}
 
 	if runtime.GOOS == "windows" {
@@ -74,10 +74,9 @@ func doMTR(ctx context.Context, taskID int, target, sourceIP string) Result {
 		"--report-cycles", "10",
 		"--max-ttl", "30",
 	}
-	// Source IP binding: mtr's --address flag binds the probe socket to the
-	// specified local address, ensuring outgoing packets leave via the correct interface.
-	if sourceIP != "" {
-		args = append(args, "--address", sourceIP)
+	// mtr --address binds the probe socket; pick the source matching the target family.
+	if src := pickSourceIP(target, sourceIPv4, sourceIPv6); src != "" {
+		args = append(args, "--address", src)
 	}
 	args = append(args, target)
 

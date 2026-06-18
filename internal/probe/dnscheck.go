@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func runDNSCheck(ctx context.Context, task Task, sourceIP string) []Result {
+func runDNSCheck(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
 	results := make([]Result, len(task.Targets))
 	var wg sync.WaitGroup
 	for i, target := range task.Targets {
@@ -16,24 +16,28 @@ func runDNSCheck(ctx context.Context, task Task, sourceIP string) []Result {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doDNSCheck(ctx, task.TaskID, target, sourceIP)
+			results[i] = doDNSCheck(ctx, task.TaskID, target, sourceIPv4, sourceIPv6)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doDNSCheck(ctx context.Context, taskID int, target, sourceIP string) Result {
+func doDNSCheck(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6 string) Result {
 	r := Result{TaskID: taskID, Type: "dnscheck", Target: target}
 
-	// Source IP binding for DNS: the custom dialer pins the UDP socket that queries
-	// the resolver to the specified local address.
+	// Source IP binding: pick source matching the DNS server's address family.
+	// The Dial callback receives the resolver's address (e.g. "8.8.8.8:53"),
+	// so we key pickSourceIP on that host rather than the lookup target.
 	resolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			var localAddr net.Addr
-			if sourceIP != "" {
-				localAddr = &net.UDPAddr{IP: net.ParseIP(sourceIP)}
+			if sourceIPv4 != "" || sourceIPv6 != "" {
+				host, _, _ := net.SplitHostPort(address)
+				if src := pickSourceIP(host, sourceIPv4, sourceIPv6); src != "" {
+					localAddr = &net.UDPAddr{IP: net.ParseIP(src)}
+				}
 			}
 			d := net.Dialer{
 				LocalAddr: localAddr,

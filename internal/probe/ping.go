@@ -9,7 +9,7 @@ import (
 	probing "github.com/prometheus-community/pro-bing"
 )
 
-func runPing(ctx context.Context, task Task, sourceIP string) []Result {
+func runPing(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
 	results := make([]Result, len(task.Targets))
 	var wg sync.WaitGroup
 	for i, target := range task.Targets {
@@ -17,27 +17,33 @@ func runPing(ctx context.Context, task Task, sourceIP string) []Result {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doPing(ctx, task.TaskID, task.Type, target, sourceIP)
+			results[i] = doPing(ctx, task.TaskID, task.Type, target, sourceIPv4, sourceIPv6)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doPing(ctx context.Context, taskID int, taskType, target, sourceIP string) Result {
+func doPing(ctx context.Context, taskID int, taskType, target, sourceIPv4, sourceIPv6 string) Result {
 	r := Result{TaskID: taskID, Type: taskType, Target: target}
 
 	pinger := probing.New(target)
 
-	// Source IP binding: forces ICMP packets to originate from the specified address,
-	// enabling egress path control when the agent host has multiple interfaces.
-	if sourceIP != "" {
-		pinger.Source = sourceIP
-	}
-
 	if err := pinger.Resolve(); err != nil {
 		r.Detail = fmt.Sprintf("resolve: %v", err)
 		return r
+	}
+
+	// Pick source IP after resolve so we know the actual address family.
+	// Binding an IPv4 source to an IPv6 target (or vice versa) would fail.
+	if pinger.IPAddr().IP.To4() != nil {
+		if sourceIPv4 != "" {
+			pinger.Source = sourceIPv4
+		}
+	} else {
+		if sourceIPv6 != "" {
+			pinger.Source = sourceIPv6
+		}
 	}
 
 	pinger.SetPrivileged(true) // requires root / CAP_NET_RAW

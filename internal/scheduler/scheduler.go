@@ -19,9 +19,11 @@ import (
 
 // taskResponse mirrors the JSON returned by GET /api/v1/agent-sync/tasks.
 type taskResponse struct {
-	AgentID  string       `json:"agent_id"`
-	SourceIP string       `json:"source_ip"` // empty means OS picks source
-	Tasks    []probe.Task `json:"tasks"`
+	AgentID    string       `json:"agent_id"`
+	SourceIP   string       `json:"source_ip"`   // legacy combined field; not used for binding
+	SourceIPv4 string       `json:"source_ipv4"` // IPv4 source address for v4-target probes
+	SourceIPv6 string       `json:"source_ipv6"` // IPv6 source address for v6-target probes
+	Tasks      []probe.Task `json:"tasks"`
 }
 
 // taskRunner tracks a running per-task goroutine so it can be cancelled
@@ -40,8 +42,9 @@ type Scheduler struct {
 	cfg      config.ServerConfig
 	sem      chan struct{}
 
-	mu       sync.RWMutex
-	sourceIP string // last source_ip from server; read by probe goroutines
+	mu         sync.RWMutex
+	sourceIPv4 string // last source_ipv4 from server; read by probe goroutines
+	sourceIPv6 string // last source_ipv6 from server; read by probe goroutines
 }
 
 func New(client *http.Client, syncURL string, rep *reporter.Reporter, cfg config.ServerConfig, maxConcurrency int) *Scheduler {
@@ -84,23 +87,26 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // reconcile fetches the current task list from the server and starts/stops
-// probe goroutines to match. If source_ip changes all runners are cancelled
-// and restarted so their sockets bind to the new interface immediately.
+// probe goroutines to match. If either source IP changes all runners are
+// cancelled and restarted so their sockets bind to the new interface immediately.
 func (s *Scheduler) reconcile(ctx context.Context, runners map[int]*taskRunner) {
-	tasks, sourceIP, err := s.fetchTasks(ctx)
+	tasks, sourceIPv4, sourceIPv6, err := s.fetchTasks(ctx)
 	if err != nil {
 		slog.Error("scheduler: task fetch failed", "err", err)
 		return
 	}
 
 	s.mu.Lock()
-	prevSourceIP := s.sourceIP
-	s.sourceIP = sourceIP
+	prevIPv4 := s.sourceIPv4
+	prevIPv6 := s.sourceIPv6
+	s.sourceIPv4 = sourceIPv4
+	s.sourceIPv6 = sourceIPv6
 	s.mu.Unlock()
 
-	if prevSourceIP != sourceIP {
+	if prevIPv4 != sourceIPv4 || prevIPv6 != sourceIPv6 {
 		slog.Info("scheduler: source_ip changed — restarting all probe goroutines",
-			"old", prevSourceIP, "new", sourceIP)
+			"old_ipv4", prevIPv4, "new_ipv4", sourceIPv4,
+			"old_ipv6", prevIPv6, "new_ipv6", sourceIPv6)
 		for id, r := range runners {
 			r.cancel()
 			delete(runners, id)
@@ -143,7 +149,7 @@ func (s *Scheduler) reconcile(ctx context.Context, runners map[int]*taskRunner) 
 	}
 
 	slog.Debug("scheduler: reconciled",
-		"running_tasks", len(runners), "source_ip", sourceIP)
+		"running_tasks", len(runners), "source_ipv4", sourceIPv4, "source_ipv6", sourceIPv6)
 }
 
 // taskChanged reports whether the server updated a task's probe parameters.
@@ -164,31 +170,31 @@ func taskChanged(old, cur probe.Task) bool {
 	return false
 }
 
-func (s *Scheduler) fetchTasks(ctx context.Context) ([]probe.Task, string, error) {
+func (s *Scheduler) fetchTasks(ctx context.Context) ([]probe.Task, string, string, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 	defer cancel()
 
 	url := strings.TrimRight(s.syncURL, "/") + "/api/v1/agent-sync/tasks"
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("GET /tasks: %w", err)
+		return nil, "", "", fmt.Errorf("GET /tasks: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("GET /tasks: HTTP %d", resp.StatusCode)
+		return nil, "", "", fmt.Errorf("GET /tasks: HTTP %d", resp.StatusCode)
 	}
 
 	var tr taskResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		return nil, "", fmt.Errorf("decode task response: %w", err)
+		return nil, "", "", fmt.Errorf("decode task response: %w", err)
 	}
-	return tr.Tasks, tr.SourceIP, nil
+	return tr.Tasks, tr.SourceIPv4, tr.SourceIPv6, nil
 }
 
 // runTask ticks at the task's configured interval and calls execute on each tick.
@@ -216,7 +222,7 @@ func (s *Scheduler) runTask(ctx context.Context, task probe.Task) {
 }
 
 // execute acquires a slot from the concurrency semaphore, reads the current
-// source IP, runs the probe, and feeds results to the reporter.
+// source IPs, runs the probe, and feeds results to the reporter.
 func (s *Scheduler) execute(ctx context.Context, task probe.Task) {
 	select {
 	case s.sem <- struct{}{}:
@@ -226,10 +232,11 @@ func (s *Scheduler) execute(ctx context.Context, task probe.Task) {
 	defer func() { <-s.sem }()
 
 	s.mu.RLock()
-	sourceIP := s.sourceIP
+	sourceIPv4 := s.sourceIPv4
+	sourceIPv6 := s.sourceIPv6
 	s.mu.RUnlock()
 
-	results := probe.Dispatch(ctx, task, sourceIP)
+	results := probe.Dispatch(ctx, task, sourceIPv4, sourceIPv6)
 	for _, r := range results {
 		s.reporter.Enqueue(r)
 	}

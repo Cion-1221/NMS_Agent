@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
 
-func runHTTPCheck(ctx context.Context, task Task, sourceIP string) []Result {
+func runHTTPCheck(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
 	results := make([]Result, len(task.Targets))
 	var wg sync.WaitGroup
 	for i, target := range task.Targets {
@@ -18,25 +19,31 @@ func runHTTPCheck(ctx context.Context, task Task, sourceIP string) []Result {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doHTTPCheck(ctx, task.TaskID, target, sourceIP)
+			results[i] = doHTTPCheck(ctx, task.TaskID, target, sourceIPv4, sourceIPv6)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doHTTPCheck(ctx context.Context, taskID int, target, sourceIP string) Result {
+func doHTTPCheck(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6 string) Result {
 	r := Result{TaskID: taskID, Type: "httpcheck", Target: target}
 
-	url := target
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		url = "http://" + url
+	rawURL := target
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		rawURL = "http://" + rawURL
 	}
 
-	// Source IP binding via a custom dialer bound to the specified local address.
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		r.Detail = fmt.Sprintf("parse url: %v", err)
+		return r
+	}
+
+	// Pick source IP matching the address family of the URL host.
 	var localAddr net.Addr
-	if sourceIP != "" {
-		localAddr = &net.TCPAddr{IP: net.ParseIP(sourceIP)}
+	if src := pickSourceIP(parsedURL.Hostname(), sourceIPv4, sourceIPv6); src != "" {
+		localAddr = &net.TCPAddr{IP: net.ParseIP(src)}
 	}
 
 	dialer := &net.Dialer{
@@ -51,7 +58,7 @@ func doHTTPCheck(ctx context.Context, taskID int, target, sourceIP string) Resul
 		},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		r.Detail = fmt.Sprintf("build request: %v", err)
 		return r

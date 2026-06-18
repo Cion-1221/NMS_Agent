@@ -39,7 +39,7 @@ type traceParams struct {
 	proto    int
 }
 
-func runTraceroute(ctx context.Context, task Task, sourceIP string) []Result {
+func runTraceroute(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
 	results := make([]Result, 0, len(task.Targets))
 	// Traceroute runs targets serially: concurrent raw-socket probes on the same
 	// host race for ICMP replies and produce unreliable hop attribution.
@@ -47,12 +47,12 @@ func runTraceroute(ctx context.Context, task Task, sourceIP string) []Result {
 		if ctx.Err() != nil {
 			break
 		}
-		results = append(results, doTraceroute(ctx, task.TaskID, task.Type, target, sourceIP))
+		results = append(results, doTraceroute(ctx, task.TaskID, task.Type, target, sourceIPv4, sourceIPv6))
 	}
 	return results
 }
 
-func doTraceroute(ctx context.Context, taskID int, taskType, target, sourceIP string) Result {
+func doTraceroute(ctx context.Context, taskID int, taskType, target, sourceIPv4, sourceIPv6 string) Result {
 	r := Result{TaskID: taskID, Type: taskType, Target: target}
 
 	if runtime.GOOS == "windows" {
@@ -74,20 +74,21 @@ func doTraceroute(ctx context.Context, taskID int, taskType, target, sourceIP st
 	var params traceParams
 	var listenNet, listenAddr string
 
+	// Bind to the source address matching the target's address family.
 	if isV4 {
 		params = traceParams{isV4: true, echoType: ipv4.ICMPTypeEcho, proto: protoICMP}
 		listenNet = "ip4:icmp"
 		listenAddr = "0.0.0.0"
+		if sourceIPv4 != "" {
+			listenAddr = sourceIPv4
+		}
 	} else {
 		params = traceParams{isV4: false, echoType: ipv6.ICMPTypeEchoRequest, proto: protoICMPv6}
 		listenNet = "ip6:ipv6-icmp"
 		listenAddr = "::"
-	}
-
-	// Source IP binding: listening on a specific address forces all outgoing ICMP
-	// Echo Requests to originate from that interface.
-	if sourceIP != "" {
-		listenAddr = sourceIP
+		if sourceIPv6 != "" {
+			listenAddr = sourceIPv6
+		}
 	}
 
 	conn, err := icmp.ListenPacket(listenNet, listenAddr)

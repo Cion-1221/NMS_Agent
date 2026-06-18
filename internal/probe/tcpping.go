@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func runTCPPing(ctx context.Context, task Task, sourceIP string) []Result {
+func runTCPPing(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
 	results := make([]Result, len(task.Targets))
 	var wg sync.WaitGroup
 	for i, target := range task.Targets {
@@ -16,14 +16,14 @@ func runTCPPing(ctx context.Context, task Task, sourceIP string) []Result {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doTCPPing(ctx, task.TaskID, target, sourceIP)
+			results[i] = doTCPPing(ctx, task.TaskID, target, sourceIPv4, sourceIPv6)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doTCPPing(ctx context.Context, taskID int, target, sourceIP string) Result {
+func doTCPPing(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6 string) Result {
 	r := Result{TaskID: taskID, Type: "tcpping", Target: target}
 
 	// Normalise the target into host:port form that net.Dial accepts.
@@ -38,10 +38,10 @@ func doTCPPing(ctx context.Context, taskID int, target, sourceIP string) Result 
 	}
 	addr := net.JoinHostPort(host, port)
 
-	// Source IP binding: LocalAddr pins the outgoing TCP SYN to a specific interface.
+	// Pick source IP matching the target's address family.
 	var localAddr net.Addr
-	if sourceIP != "" {
-		localAddr = &net.TCPAddr{IP: net.ParseIP(sourceIP)}
+	if src := pickSourceIP(host, sourceIPv4, sourceIPv6); src != "" {
+		localAddr = &net.TCPAddr{IP: net.ParseIP(src)}
 	}
 
 	dialer := &net.Dialer{

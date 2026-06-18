@@ -4,6 +4,7 @@ package probe
 
 import (
 	"context"
+	"net"
 	"time"
 )
 
@@ -25,25 +26,49 @@ type Result struct {
 	Detail    string   `json:"detail,omitempty"`
 }
 
-// Dispatch routes a task to its probe implementation. sourceIP may be empty,
-// in which case the OS chooses the source address.
-func Dispatch(ctx context.Context, task Task, sourceIP string) []Result {
+// Dispatch routes a task to its probe implementation.
+// sourceIPv4 and sourceIPv6 may each be empty; probes select the correct one
+// per target based on address family. Both empty means the OS picks source.
+func Dispatch(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
 	switch task.Type {
 	case "ping", "meshping":
-		return runPing(ctx, task, sourceIP)
+		return runPing(ctx, task, sourceIPv4, sourceIPv6)
 	case "tcpping":
-		return runTCPPing(ctx, task, sourceIP)
+		return runTCPPing(ctx, task, sourceIPv4, sourceIPv6)
 	case "httpcheck":
-		return runHTTPCheck(ctx, task, sourceIP)
+		return runHTTPCheck(ctx, task, sourceIPv4, sourceIPv6)
 	case "dnscheck":
-		return runDNSCheck(ctx, task, sourceIP)
+		return runDNSCheck(ctx, task, sourceIPv4, sourceIPv6)
 	case "traceroute":
-		return runTraceroute(ctx, task, sourceIP)
+		return runTraceroute(ctx, task, sourceIPv4, sourceIPv6)
 	case "mtr":
-		return runMTR(ctx, task, sourceIP)
+		return runMTR(ctx, task, sourceIPv4, sourceIPv6)
 	default:
 		return nil
 	}
+}
+
+// pickSourceIP returns the source IP that matches the address family of host.
+// It checks net.ParseIP first (no I/O) and falls back to a DNS lookup for
+// hostnames. Returns "" when the family cannot be determined.
+func pickSourceIP(host, sourceIPv4, sourceIPv6 string) string {
+	if sourceIPv4 == "" && sourceIPv6 == "" {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			return sourceIPv4
+		}
+		return sourceIPv6
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		return sourceIPv4
+	}
+	if ip := net.ParseIP(addrs[0]); ip != nil && ip.To4() == nil {
+		return sourceIPv6
+	}
+	return sourceIPv4
 }
 
 // msPtr converts a duration to a *float64 milliseconds pointer for the Result field.
