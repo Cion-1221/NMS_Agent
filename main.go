@@ -333,8 +333,9 @@ func main() {
 	}
 
 	if pendingUpdate != nil {
-		log.Info("applying update", "version", pendingUpdate.Version)
-		if err := updater.Apply(mtlsClient, *pendingUpdate); err != nil {
+		log.Info("applying update", "version", pendingUpdate.Version,
+			"binary_id", pendingUpdate.BinaryID, "size", pendingUpdate.FileSize)
+		if err := updater.Apply(mtlsClient, cfg.Server.ReportURL, *pendingUpdate); err != nil {
 			log.Error("update failed — exiting for service manager restart", "err", err)
 			os.Exit(1)
 		}

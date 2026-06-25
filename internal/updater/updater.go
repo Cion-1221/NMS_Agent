@@ -15,16 +15,18 @@ import (
 
 // Update describes a pending agent update as returned by GET /api/v1/agent-sync/tasks.
 type Update struct {
-	Version     string `json:"version"`
-	DownloadURL string `json:"url"`
-	SHA256      string `json:"sha256"`
+	Version  string `json:"version"`
+	BinaryID uint   `json:"binary_id"`
+	SHA256   string `json:"sha256"`
+	FileSize int64  `json:"file_size"` // bytes; used to pre-allocate temp file
 }
 
-// Apply downloads the new binary from u.DownloadURL using client, verifies its
-// SHA-256, atomically replaces the running executable, then restarts the process.
+// Apply downloads the new binary from {syncURL}/api/v1/agent-sync/binary/{BinaryID}
+// using the mTLS client, verifies its SHA-256, atomically replaces the running
+// executable, then restarts the process.
 // On Linux/Darwin the process is replaced in-place via syscall.Exec (same PID).
 // On Windows the process exits cleanly and the service manager restarts it.
-func Apply(client *http.Client, u Update) error {
+func Apply(client *http.Client, syncURL string, u Update) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
@@ -34,7 +36,10 @@ func Apply(client *http.Client, u Update) error {
 		return fmt.Errorf("resolve symlink: %w", err)
 	}
 
-	tmp, sum, err := download(client, u.DownloadURL, filepath.Dir(exe))
+	downloadURL := strings.TrimRight(syncURL, "/") +
+		fmt.Sprintf("/api/v1/agent-sync/binary/%d", u.BinaryID)
+
+	tmp, sum, err := download(client, downloadURL, filepath.Dir(exe), u.FileSize)
 	if err != nil {
 		return err
 	}
@@ -59,8 +64,9 @@ func Apply(client *http.Client, u Update) error {
 }
 
 // download fetches url into a temp file inside dir, computing SHA-256 on the fly.
+// sizeHint is used to pre-allocate disk space when > 0 (best-effort).
 // Returns the temp file path and its hex SHA-256 sum. Caller must remove on error.
-func download(client *http.Client, url, dir string) (path, sha256sum string, err error) {
+func download(client *http.Client, url, dir string, sizeHint int64) (path, sha256sum string, err error) {
 	// Binary downloads can be large; use a generous timeout regardless of the
 	// client's default request_timeout.
 	dl := *client
@@ -71,6 +77,12 @@ func download(client *http.Client, url, dir string) (path, sha256sum string, err
 		return "", "", fmt.Errorf("create temp file: %w", err)
 	}
 	path = f.Name()
+
+	// Pre-allocate to avoid fragmentation on large binaries.
+	if sizeHint > 0 {
+		_ = f.Truncate(sizeHint)
+		_, _ = f.Seek(0, io.SeekStart)
+	}
 
 	resp, err := dl.Get(url)
 	if err != nil {
