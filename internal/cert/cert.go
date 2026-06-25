@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -197,6 +198,21 @@ func Renew(client *http.Client, syncURL, certDir string) error {
 		}
 	}
 	return nil
+}
+
+// NewMTLSClientForFamily is like NewMTLSClient but restricts all TCP connections
+// to the given address family: "tcp4" for IPv4-only, "tcp6" for IPv6-only.
+// Used to query the server's /my-ip reflection endpoint over each family
+// separately, so the agent can discover its public addresses behind NAT.
+func NewMTLSClientForFamily(dir string, timeout time.Duration, network string) (*http.Client, error) {
+	client, err := NewMTLSClient(dir, timeout)
+	if err != nil {
+		return nil, err
+	}
+	client.Transport.(*http.Transport).DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	return client, nil
 }
 
 // NewMTLSClient builds an http.Client that presents the agent's client certificate

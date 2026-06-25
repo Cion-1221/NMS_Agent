@@ -14,10 +14,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,17 +39,107 @@ var (
 	buildDate = "unknown"
 )
 
-// versionTransport injects X-Agent-Version into every outbound request so the NMS
-// server can record which agent software version is connecting without inspecting the cert.
+// versionTransport injects X-Agent-Version and the agent's public IPs into
+// every outbound mTLS request. Public IPs are discovered by runIPRefresh via
+// the server's /my-ip reflection endpoint and updated here; they start empty
+// until the first successful discovery, at which point the server falls back
+// to c.ClientIP() for whichever family header is absent.
 type versionTransport struct {
 	base http.RoundTripper
 	ver  string
+
+	ipMu       sync.RWMutex
+	publicIPv4 string
+	publicIPv6 string
+}
+
+// setIPs stores newly discovered public IPs. A non-empty value overwrites the
+// cached one; empty values are ignored so a temporary failure on one family
+// does not clear a previously discovered address.
+func (t *versionTransport) setIPs(ipv4, ipv6 string) {
+	t.ipMu.Lock()
+	defer t.ipMu.Unlock()
+	if ipv4 != "" {
+		t.publicIPv4 = ipv4
+	}
+	if ipv6 != "" {
+		t.publicIPv6 = ipv6
+	}
 }
 
 func (t *versionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	req.Header.Set("X-Agent-Version", t.ver)
+	t.ipMu.RLock()
+	ipv4, ipv6 := t.publicIPv4, t.publicIPv6
+	t.ipMu.RUnlock()
+	if ipv4 != "" {
+		req.Header.Set("X-Agent-IPv4", ipv4)
+	}
+	if ipv6 != "" {
+		req.Header.Set("X-Agent-IPv6", ipv6)
+	}
 	return t.base.RoundTrip(req)
+}
+
+// runIPRefresh queries the server's /my-ip endpoint over forced IPv4 and IPv6
+// connections to discover the agent's public addresses as seen by the server.
+// This correctly handles cloud NAT (GCP/AWS) where the local interface IP
+// differs from the public IP. Results are refreshed every 24 h.
+func runIPRefresh(ctx context.Context, certDir, reportURL string, vt *versionTransport) {
+	const interval = 24 * time.Hour
+	myIPURL := strings.TrimRight(reportURL, "/") + "/api/v1/agent-sync/my-ip"
+
+	detect := func() {
+		var ipv4, ipv6 string
+		for _, pair := range []struct {
+			network string
+			out     *string
+		}{
+			{"tcp4", &ipv4},
+			{"tcp6", &ipv6},
+		} {
+			c, err := cert.NewMTLSClientForFamily(certDir, 10*time.Second, pair.network)
+			if err != nil {
+				continue
+			}
+			reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, myIPURL, nil)
+			if err != nil {
+				cancel()
+				continue
+			}
+			resp, err := c.Do(req)
+			cancel()
+			if err != nil {
+				slog.Debug("ip refresh: request failed", "network", pair.network, "err", err)
+				continue
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				if ip := strings.TrimSpace(string(body)); net.ParseIP(ip) != nil {
+					*pair.out = ip
+				}
+			}
+		}
+		if ipv4 != "" || ipv6 != "" {
+			vt.setIPs(ipv4, ipv6)
+			slog.Info("ip refresh: public IPs updated", "ipv4", ipv4, "ipv6", ipv6)
+		}
+	}
+
+	detect() // run immediately on startup
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			detect()
+		}
+	}
 }
 
 // runCertRenewal checks the mTLS certificate expiry once per day and renews it
@@ -171,11 +264,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Wrap transport to inject X-Agent-Version header on all mTLS requests.
-	mtlsClient.Transport = &versionTransport{base: mtlsClient.Transport, ver: version}
+	// Wrap transport to inject X-Agent-Version and public IP headers on all mTLS requests.
+	// Public IPs start empty; runIPRefresh populates them after the first /my-ip query.
+	vt := &versionTransport{base: mtlsClient.Transport, ver: version}
+	mtlsClient.Transport = vt
 
 	// Certificate auto-renewal — checks once per day, renews if < 30 days remain.
 	go runCertRenewal(ctx, certDir, cfg.Server.ReportURL, mtlsClient, log)
+
+	// Public IP discovery — queries /my-ip via forced IPv4 and IPv6 connections so
+	// the server can display both addresses even when the agent is behind cloud NAT.
+	go runIPRefresh(ctx, certDir, cfg.Server.ReportURL, vt)
 
 	// ── Reporter & Scheduler ───────────────────────────────────────────────────
 	rep := reporter.New(mtlsClient, cfg.Server.ReportURL, cfg.Server)
