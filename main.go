@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -47,6 +48,8 @@ var (
 type versionTransport struct {
 	base http.RoundTripper
 	ver  string
+	os   string // runtime.GOOS  — e.g. "linux", "windows", "darwin"
+	arch string // runtime.GOARCH — e.g. "amd64", "arm64"
 
 	ipMu       sync.RWMutex
 	publicIPv4 string
@@ -70,6 +73,8 @@ func (t *versionTransport) setIPs(ipv4, ipv6 string) {
 func (t *versionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	req.Header.Set("X-Agent-Version", t.ver)
+	req.Header.Set("X-Agent-OS", t.os)
+	req.Header.Set("X-Agent-Arch", t.arch)
 	t.ipMu.RLock()
 	ipv4, ipv6 := t.publicIPv4, t.publicIPv6
 	t.ipMu.RUnlock()
@@ -266,7 +271,12 @@ func main() {
 
 	// Wrap transport to inject X-Agent-Version and public IP headers on all mTLS requests.
 	// Public IPs start empty; runIPRefresh populates them after the first /my-ip query.
-	vt := &versionTransport{base: mtlsClient.Transport, ver: version}
+	vt := &versionTransport{
+		base: mtlsClient.Transport,
+		ver:  version,
+		os:   runtime.GOOS,
+		arch: runtime.GOARCH,
+	}
 	mtlsClient.Transport = vt
 
 	// Certificate auto-renewal — checks once per day, renews if < 30 days remain.
