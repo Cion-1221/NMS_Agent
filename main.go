@@ -31,6 +31,7 @@ import (
 	"github.com/Cion-1221/NMS_Agent/internal/logger"
 	"github.com/Cion-1221/NMS_Agent/internal/reporter"
 	"github.com/Cion-1221/NMS_Agent/internal/scheduler"
+	"github.com/Cion-1221/NMS_Agent/internal/updater"
 )
 
 // Injected at release build time via -ldflags.
@@ -304,7 +305,17 @@ func main() {
 		sched.Run(ctx)
 	}()
 
-	<-ctx.Done()
+	// Wait for a shutdown signal (SIGINT/SIGTERM) or an update directive from
+	// the server. Both paths go through the same graceful shutdown sequence.
+	var pendingUpdate *updater.Update
+	select {
+	case upd := <-sched.UpdateCh():
+		log.Info("update available — starting graceful shutdown", "version", upd.Version)
+		pendingUpdate = &upd
+		stop() // cancel context so scheduler and reporter goroutines exit
+	case <-ctx.Done():
+	}
+
 	log.Info("shutdown signal received", "grace_period", cfg.Runtime.GracePeriod)
 
 	done := make(chan struct{})
@@ -319,5 +330,14 @@ func main() {
 	case <-time.After(cfg.Runtime.GracePeriod):
 		log.Warn("grace period exceeded — forcing exit")
 		os.Exit(1)
+	}
+
+	if pendingUpdate != nil {
+		log.Info("applying update", "version", pendingUpdate.Version)
+		if err := updater.Apply(mtlsClient, *pendingUpdate); err != nil {
+			log.Error("update failed — exiting for service manager restart", "err", err)
+			os.Exit(1)
+		}
+		// Apply calls syscall.Exec (Linux) or os.Exit (Windows); unreachable.
 	}
 }

@@ -15,15 +15,17 @@ import (
 	"github.com/Cion-1221/NMS_Agent/internal/config"
 	"github.com/Cion-1221/NMS_Agent/internal/probe"
 	"github.com/Cion-1221/NMS_Agent/internal/reporter"
+	"github.com/Cion-1221/NMS_Agent/internal/updater"
 )
 
 // taskResponse mirrors the JSON returned by GET /api/v1/agent-sync/tasks.
 type taskResponse struct {
-	AgentID    string       `json:"agent_id"`
-	SourceIP   string       `json:"source_ip"`   // legacy combined field; not used for binding
-	SourceIPv4 string       `json:"source_ipv4"` // IPv4 source address for v4-target probes
-	SourceIPv6 string       `json:"source_ipv6"` // IPv6 source address for v6-target probes
-	Tasks      []probe.Task `json:"tasks"`
+	AgentID    string          `json:"agent_id"`
+	SourceIP   string          `json:"source_ip"`   // legacy combined field; not used for binding
+	SourceIPv4 string          `json:"source_ipv4"` // IPv4 source address for v4-target probes
+	SourceIPv6 string          `json:"source_ipv6"` // IPv6 source address for v6-target probes
+	Tasks      []probe.Task    `json:"tasks"`
+	Update     *updater.Update `json:"update"` // non-nil when server wants the agent to upgrade
 }
 
 // taskRunner tracks a running per-task goroutine so it can be cancelled
@@ -41,6 +43,7 @@ type Scheduler struct {
 	reporter *reporter.Reporter
 	cfg      config.ServerConfig
 	sem      chan struct{}
+	updateCh chan updater.Update // capacity 1; fires at most once when server requests upgrade
 
 	mu         sync.RWMutex
 	sourceIPv4 string // last source_ipv4 from server; read by probe goroutines
@@ -57,7 +60,14 @@ func New(client *http.Client, syncURL string, rep *reporter.Reporter, cfg config
 		reporter: rep,
 		cfg:      cfg,
 		sem:      make(chan struct{}, maxConcurrency),
+		updateCh: make(chan updater.Update, 1),
 	}
+}
+
+// UpdateCh returns a receive-only channel that fires at most once when the
+// server instructs this agent to upgrade to a newer version.
+func (s *Scheduler) UpdateCh() <-chan updater.Update {
+	return s.updateCh
 }
 
 // Run polls the server for tasks on each TaskPollInterval tick and reconciles
@@ -90,10 +100,18 @@ func (s *Scheduler) Run(ctx context.Context) {
 // probe goroutines to match. If either source IP changes all runners are
 // cancelled and restarted so their sockets bind to the new interface immediately.
 func (s *Scheduler) reconcile(ctx context.Context, runners map[int]*taskRunner) {
-	tasks, sourceIPv4, sourceIPv6, err := s.fetchTasks(ctx)
+	tasks, sourceIPv4, sourceIPv6, upd, err := s.fetchTasks(ctx)
 	if err != nil {
 		slog.Error("scheduler: task fetch failed", "err", err)
 		return
+	}
+
+	if upd != nil {
+		select {
+		case s.updateCh <- *upd:
+			slog.Info("scheduler: update available", "version", upd.Version)
+		default: // already queued; ignore duplicate
+		}
 	}
 
 	s.mu.Lock()
@@ -170,31 +188,31 @@ func taskChanged(old, cur probe.Task) bool {
 	return false
 }
 
-func (s *Scheduler) fetchTasks(ctx context.Context) ([]probe.Task, string, string, error) {
+func (s *Scheduler) fetchTasks(ctx context.Context) ([]probe.Task, string, string, *updater.Update, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 	defer cancel()
 
 	url := strings.TrimRight(s.syncURL, "/") + "/api/v1/agent-sync/tasks"
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", nil, err
 	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("GET /tasks: %w", err)
+		return nil, "", "", nil, fmt.Errorf("GET /tasks: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", "", fmt.Errorf("GET /tasks: HTTP %d", resp.StatusCode)
+		return nil, "", "", nil, fmt.Errorf("GET /tasks: HTTP %d", resp.StatusCode)
 	}
 
 	var tr taskResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		return nil, "", "", fmt.Errorf("decode task response: %w", err)
+		return nil, "", "", nil, fmt.Errorf("decode task response: %w", err)
 	}
-	return tr.Tasks, tr.SourceIPv4, tr.SourceIPv6, nil
+	return tr.Tasks, tr.SourceIPv4, tr.SourceIPv6, tr.Update, nil
 }
 
 // runTask ticks at the task's configured interval and calls execute on each tick.
