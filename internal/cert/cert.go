@@ -146,9 +146,9 @@ func CertExpiry(dir string) (time.Time, error) {
 }
 
 // Renew calls POST /api/v1/agent-sync/renew-cert using the current mTLS client
-// and overwrites the cert files on disk. Because NewMTLSClient uses
-// GetClientCertificate (reads from disk on each TLS handshake), subsequent
-// connections automatically use the new certificate without an agent restart.
+// and overwrites the cert files on disk. Because NewMTLSClient uses DialTLSContext
+// (reads certs from disk on every new TLS connection), subsequent connections
+// automatically use the renewed certificate and CA without an agent restart.
 func Renew(client *http.Client, syncURL, certDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -200,26 +200,11 @@ func Renew(client *http.Client, syncURL, certDir string) error {
 	return nil
 }
 
-// NewMTLSClientForFamily is like NewMTLSClient but restricts all TCP connections
-// to the given address family: "tcp4" for IPv4-only, "tcp6" for IPv6-only.
-// Used to query the server's /my-ip reflection endpoint over each family
-// separately, so the agent can discover its public addresses behind NAT.
-func NewMTLSClientForFamily(dir string, timeout time.Duration, network string) (*http.Client, error) {
-	client, err := NewMTLSClient(dir, timeout)
-	if err != nil {
-		return nil, err
-	}
-	client.Transport.(*http.Transport).DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, network, addr)
-	}
-	return client, nil
-}
-
-// NewMTLSClient builds an http.Client that presents the agent's client certificate
-// and trusts only the NMS server's CA. GetClientCertificate re-reads the cert
-// from disk on every TLS handshake, so cert.Renew() takes effect without a restart.
-func NewMTLSClient(dir string, timeout time.Duration) (*http.Client, error) {
-	caPEM, err := os.ReadFile(filepath.Join(dir, fileCACert))
+// dialMTLS establishes a TLS connection for mTLS, reading the CA cert and client
+// cert+key fresh from disk each call. This ensures CA rotation and cert renewal
+// take effect on the next new connection without an agent restart.
+func dialMTLS(ctx context.Context, network, addr, caFile, certFile, keyFile string) (net.Conn, error) {
+	caPEM, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("read CA cert: %w", err)
 	}
@@ -228,28 +213,83 @@ func NewMTLSClient(dir string, timeout time.Duration) (*http.Client, error) {
 		return nil, fmt.Errorf("parse CA cert: no valid PEM blocks")
 	}
 
-	certFile := filepath.Join(dir, fileCert)
-	keyFile := filepath.Join(dir, fileKey)
-
-	// Validate the key pair once on startup so errors surface immediately.
-	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+	clientCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
 		return nil, fmt.Errorf("load client cert/key: %w", err)
 	}
 
-	tlsCfg := &tls.Config{
-		GetClientCertificate: func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			c, err := tls.LoadX509KeyPair(certFile, keyFile)
-			if err != nil {
-				return nil, err
-			}
-			return &c, nil
+	host, _, _ := net.SplitHostPort(addr)
+	tlsDialer := &tls.Dialer{
+		NetDialer: &net.Dialer{},
+		Config: &tls.Config{
+			Certificates: []tls.Certificate{clientCert},
+			RootCAs:      pool,
+			ServerName:   host,
+			MinVersion:   tls.VersionTLS12,
 		},
-		RootCAs:    pool,
-		MinVersion: tls.VersionTLS12,
+	}
+	return tlsDialer.DialContext(ctx, network, addr)
+}
+
+// NewMTLSClient builds an http.Client that presents the agent's client certificate
+// and trusts only the NMS server's CA. Both the CA cert and client cert are read
+// from disk on every new TLS connection so that CA rotation and cert renewal take
+// effect immediately without an agent restart.
+func NewMTLSClient(dir string, timeout time.Duration) (*http.Client, error) {
+	caFile := filepath.Join(dir, fileCACert)
+	certFile := filepath.Join(dir, fileCert)
+	keyFile := filepath.Join(dir, fileKey)
+
+	// Validate files exist and are parseable at startup so errors surface immediately.
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		return nil, fmt.Errorf("load client cert/key: %w", err)
+	}
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read CA cert: %w", err)
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("parse CA cert: no valid PEM blocks")
 	}
 
 	return &http.Client{
-		Timeout:   timeout,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		Timeout: timeout,
+		Transport: &http.Transport{
+			// Re-read both certs from disk on every new TLS connection.
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialMTLS(ctx, network, addr, caFile, certFile, keyFile)
+			},
+		},
+	}, nil
+}
+
+// NewMTLSClientForFamily is like NewMTLSClient but restricts all TCP connections
+// to the given address family: "tcp4" for IPv4-only, "tcp6" for IPv6-only.
+// Used to query the server's /my-ip reflection endpoint over each family
+// separately, so the agent can discover its public addresses behind NAT.
+func NewMTLSClientForFamily(dir string, timeout time.Duration, network string) (*http.Client, error) {
+	caFile := filepath.Join(dir, fileCACert)
+	certFile := filepath.Join(dir, fileCert)
+	keyFile := filepath.Join(dir, fileKey)
+
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		return nil, fmt.Errorf("load client cert/key: %w", err)
+	}
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read CA cert: %w", err)
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("parse CA cert: no valid PEM blocks")
+	}
+
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialTLSContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				// Force the specified network family (tcp4 or tcp6).
+				return dialMTLS(ctx, network, addr, caFile, certFile, keyFile)
+			},
+		},
 	}, nil
 }
