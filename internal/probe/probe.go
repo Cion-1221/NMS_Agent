@@ -41,7 +41,7 @@ func Dispatch(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []R
 		return runDNSCheck(ctx, task, sourceIPv4, sourceIPv6)
 	case "traceroute":
 		return runTraceroute(ctx, task, sourceIPv4, sourceIPv6)
-	case "mtr":
+	case "mtr", "meshmtr":
 		return runMTR(ctx, task, sourceIPv4, sourceIPv6)
 	default:
 		return nil

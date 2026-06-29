@@ -49,15 +49,15 @@ func runMTR(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Res
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doMTR(ctx, task.TaskID, target, sourceIPv4, sourceIPv6)
+			results[i] = doMTR(ctx, task.TaskID, task.Type, target, sourceIPv4, sourceIPv6)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doMTR(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6 string) Result {
-	r := Result{TaskID: taskID, Type: "mtr", Target: target}
+func doMTR(ctx context.Context, taskID int, taskType, target, sourceIPv4, sourceIPv6 string) Result {
+	r := Result{TaskID: taskID, Type: taskType, Target: target}
 
 	if runtime.GOOS == "windows" {
 		r.Detail = "mtr is not available on Windows; use traceroute (requires admin) or tcpping instead"
