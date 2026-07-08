@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -185,7 +186,37 @@ func taskChanged(old, cur probe.Task) bool {
 			return true
 		}
 	}
+	if snmpParamsChanged(old.SNMP, cur.SNMP) {
+		return true
+	}
 	return false
+}
+
+// snmpParamsChanged compares the SNMP parameter blocks of two tasks — a changed
+// credential/port/version/OID list must restart the runner just like a changed
+// target. Field-by-field because ExtraOIDs (a slice) makes the struct
+// non-comparable.
+func snmpParamsChanged(a, b *probe.SNMPParams) bool {
+	if (a == nil) != (b == nil) {
+		return true
+	}
+	if a == nil {
+		return false
+	}
+	return a.DeviceID != b.DeviceID ||
+		a.Version != b.Version ||
+		a.Community != b.Community ||
+		a.Port != b.Port ||
+		a.TimeoutSeconds != b.TimeoutSeconds ||
+		a.Retries != b.Retries ||
+		a.InventoryEveryN != b.InventoryEveryN ||
+		a.V3User != b.V3User ||
+		a.V3AuthProto != b.V3AuthProto ||
+		a.V3AuthPass != b.V3AuthPass ||
+		a.V3PrivProto != b.V3PrivProto ||
+		a.V3PrivPass != b.V3PrivPass ||
+		a.CollectIfaces != b.CollectIfaces ||
+		!slices.Equal(a.ExtraOIDs, b.ExtraOIDs)
 }
 
 func (s *Scheduler) fetchTasks(ctx context.Context) ([]probe.Task, string, string, *updater.Update, error) {
@@ -217,14 +248,28 @@ func (s *Scheduler) fetchTasks(ctx context.Context) ([]probe.Task, string, strin
 
 // runTask ticks at the task's configured interval and calls execute on each tick.
 // The task runs once immediately on startup so results arrive before the first
-// interval elapses.
+// interval elapses. snmp_poll runners add a deterministic startup offset
+// (task_id spread across the interval) so co-assigned devices are not all hit
+// in the same second on every cycle; all runners share one reconcile instant,
+// so without the offset they would stay phase-locked forever.
 func (s *Scheduler) runTask(ctx context.Context, task probe.Task) {
 	interval := time.Duration(task.IntervalSeconds) * time.Second
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
 
-	s.execute(ctx, task) // run immediately
+	if task.Type == "snmp_poll" && task.IntervalSeconds > 1 {
+		offset := time.Duration(task.TaskID%task.IntervalSeconds) * time.Second
+		select {
+		case <-time.After(offset):
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	var seq uint64
+	s.execute(ctx, task, seq) // run immediately (after optional offset)
+	seq++
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -234,20 +279,32 @@ func (s *Scheduler) runTask(ctx context.Context, task probe.Task) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.execute(ctx, task)
+			s.execute(ctx, task, seq)
+			seq++
 		}
 	}
 }
 
 // execute acquires a slot from the concurrency semaphore, reads the current
-// source IPs, runs the probe, and feeds results to the reporter.
-func (s *Scheduler) execute(ctx context.Context, task probe.Task) {
+// source IPs, runs the probe, and feeds results to the reporter. seq is the
+// per-runner tick counter: snmp_poll uses it for the fast/slow cadence (the
+// first tick and every InventoryEveryN-th tick fetch the full system group).
+func (s *Scheduler) execute(ctx context.Context, task probe.Task, seq uint64) {
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
 		return
 	}
 	defer func() { <-s.sem }()
+
+	if task.Type == "snmp_poll" {
+		if task.SNMP == nil {
+			return // malformed payload; nothing useful to report
+		}
+		full := task.SNMP.InventoryEveryN <= 1 || seq%uint64(task.SNMP.InventoryEveryN) == 0
+		s.reporter.EnqueueSNMP(probe.RunSNMPPoll(task, full))
+		return
+	}
 
 	s.mu.RLock()
 	sourceIPv4 := s.sourceIPv4

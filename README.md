@@ -30,6 +30,7 @@
 - **证书热更新**：mTLS 客户端使用 `GetClientCertificate` 回调，续签后的证书在下一次 TLS 握手时即时生效，无需重启。
 - **证书自动续签**：后台 goroutine 每日检查证书有效期，剩余不足 30 天时自动调用 `POST /api/v1/agent-sync/renew-cert` 续签。
 - **Source IP 绑定**：服务端可为每个 Agent 指定出站源 IP（IPv4 或 IPv6），所有探测的发包 socket 均绑定到该地址，确保流量从指定网卡出站。源 IP 变更时探测 goroutine 自动重启，立即生效。
+- **SNMP 探针代理**：服务端把指派给本 Agent 的设备合成为 `snmp_poll` 任务（目标 IP / 凭证 / 周期随任务下发，本地零配置），Agent 采集 RFC 1213 system 组并把结论批量回传 `POST /agent-sync/snmp-results`，驱动服务端的设备运行状态。凭证仅内存持有、不落盘、不入日志。
 - **全协议双栈**：ping、tcpping、httpcheck、dnscheck、traceroute、mtr 均原生支持 IPv4 和 IPv6 目标，无需额外配置。
 - **批量上报**：探测结果写入内存队列，按批次大小或刷新间隔批量 POST 到服务端，避免高频小请求。
 - **优雅停机**：捕获 `SIGINT`/`SIGTERM`，等待正在执行的探测和上传在宽限期内完成后退出。
@@ -44,6 +45,7 @@
   │  :8443  POST /api/v1/agents/enroll  (一次性，单向 TLS) │
   │  :8444  GET  /api/v1/agent-sync/tasks        (mTLS)   │
   │  :8444  POST /api/v1/agent-sync/results      (mTLS)   │
+  │  :8444  POST /api/v1/agent-sync/snmp-results (mTLS)   │
   │  :8444  POST /api/v1/agent-sync/renew-cert   (mTLS)   │
   └────────────────────┬─────────────────────────────────┘
                         │
@@ -73,6 +75,7 @@
   │   dnscheck.go  — DNS（net.Resolver，UDP bind）       │
   │   traceroute.go— 原始 ICMP 套接字（Linux/macOS）     │
   │   mtr.go       — 调用系统 mtr 二进制（Linux/macOS）  │
+  │   snmp.go      — SNMP v1/v2c GET（gosnmp，代理采集） │
   └─────────────────────────────────────────────────────┘
 ```
 
@@ -105,9 +108,10 @@ NMS_Agent/
     │   ├── httpcheck.go          #   HTTP(S) 健康检查
     │   ├── dnscheck.go           #   DNS 解析探测
     │   ├── traceroute.go         #   逐跳路由追踪
-    │   └── mtr.go                #   MTR（调用系统二进制）
-    ├── reporter/reporter.go      # 攒批 + HTTP POST 到 /results
-    └── scheduler/scheduler.go   # 任务拉取 + diff 式协程管理
+    │   ├── mtr.go                #   MTR（调用系统二进制）
+    │   └── snmp.go               #   SNMP 代理采集（system 组，快/慢两档）
+    ├── reporter/reporter.go      # 攒批 + HTTP POST 到 /results 与 /snmp-results（双队列）
+    └── scheduler/scheduler.go   # 任务拉取 + diff 式协程管理（snmp_poll 带启动错峰）
 ```
 
 ## 探测类型
@@ -122,10 +126,13 @@ NMS_Agent/
 | `dnscheck` | DNS UDP | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `traceroute` | 原始 ICMP | ✅ | ✅ | ✅ | ❌‡ | ✅ |
 | `mtr` | `mtr` 二进制 | ✅ | ✅ | ✅ | ❌‡ | ✅ |
+| `snmp_poll` | SNMP v1/v2c UDP（gosnmp） | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 \* Windows 下 ICMP ping 通常需要管理员权限或放行防火墙。  
 † httpcheck 的 IPv6 目标 URL 须使用 RFC 3986 括号格式：`http://[2001:db8::1]/path`。  
 ‡ Windows 上 traceroute 和 mtr 任务返回明确的不支持错误结果，不会导致 Agent 崩溃。
+
+**snmp_poll（SNMP 探针代理）**与其余类型不同：任务由服务端从设备表**逐台合成**（虚拟 TaskID，一台设备一条任务），参数块携带目标 IP、SNMP 版本（v1/v2c/**v3**）、凭证（community 或 v3 的 USM 用户/认证/加密协议与口令）、端口、超时与重试、快慢采集节奏（`inventory_every_n`）、**自定义标量 OID 列表**（`extra_oids`）以及**接口表开关**（`collect_interfaces`——每周期 WALK `ifTable`/`ifXTable` 两个子树，v2c/v3 用 GETBULK、v1 退回 GETNEXT，随结果上报原始计数器由服务端换算速率；WALK 失败不影响本次采集结论）。Agent 每周期只采 `sysUpTime` + 自定义 OID（最小报文，兼做存活判定），每 N 次附带完整 system 组（sysName/sysDescr/sysObjectID/sysLocation/sysContact）；结论走独立队列批量回传 `POST /agent-sync/snmp-results`，每条携带采集时刻 `collected_at`（unix 秒）——服务端以它为 counter 速率换算与时序时间轴的基准，批量攒批不会扭曲速率。v3 的认证失败（USM 错误）显式归类为 `auth_fail` 上报（notInTimeWindow 时间窗重同步除外，gosnmp 自动处理）。多台设备的采集相位按 TaskID 在周期内错开，避免同机房设备被同秒齐射。凭证只存在于内存中的任务快照——每个同步周期从服务端全量重建，从不写盘、不打日志。
 
 ## 快速开始
 
