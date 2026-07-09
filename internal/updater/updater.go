@@ -74,7 +74,10 @@ func download(client *http.Client, url, dir string, sizeHint int64) (path, sha25
 
 	f, err := os.CreateTemp(dir, ".nms-agent-update-*")
 	if err != nil {
-		return "", "", fmt.Errorf("create temp file: %w", err)
+		// The temp file MUST live next to the executable: os.Rename is only atomic
+		// within one filesystem. A read-only install dir (typically systemd
+		// ProtectSystem=strict without the install dir in ReadWritePaths) lands here.
+		return "", "", fmt.Errorf("create temp file: %w (OTA writes the new binary next to the executable for an atomic rename — under systemd ProtectSystem=strict the install directory must be listed in ReadWritePaths)", err)
 	}
 	path = f.Name()
 

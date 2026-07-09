@@ -400,8 +400,11 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# ProtectSystem=strict 将文件系统设为只读；运行时需要写入的目录必须在此列出
-ReadWritePaths=/opt/nms-agent/logs /opt/nms-agent/.certs
+# ProtectSystem=strict 将文件系统设为只读；运行时需要写入的目录必须在此列出。
+# ⚠️ 必须包含安装目录本身（而不仅是 logs/.certs 子目录）：OTA 自更新要在可执行
+# 文件旁写入临时二进制再原子替换（rename 只在同一文件系统内原子），目录只读会让
+# 更新陷入失败重启循环，日志表现为 "create temp file: ... read-only file system"
+ReadWritePaths=/opt/nms-agent
 
 [Install]
 WantedBy=multi-user.target
@@ -428,7 +431,11 @@ useradd -r -s /sbin/nologin -d /var/lib/nms-agent -m nms-agent
 **安装文件**
 
 ```bash
-install -o root -g root -m 755 nms-agent /usr/local/bin/nms-agent
+# 二进制放在服务账户可写的目录：OTA 自更新要求进程能替换自身二进制
+# （非 root 账户替换不了 /usr/local/bin 下 root 属主的文件）。
+# 若安全策略要求二进制目录只读，请装回 /usr/local/bin 并放弃 OTA、改用外部方式分发更新。
+mkdir -p /var/lib/nms-agent/bin
+install -o nms-agent -g nms-agent -m 755 nms-agent /var/lib/nms-agent/bin/nms-agent
 
 mkdir -p /etc/nms-agent
 install -o root -g nms-agent -m 640 configs/config.yaml /etc/nms-agent/config.yaml
@@ -474,7 +481,7 @@ Wants=network-online.target
 Type=simple
 User=nms-agent
 Group=nms-agent
-ExecStart=/usr/local/bin/nms-agent -config /etc/nms-agent/config.yaml
+ExecStart=/var/lib/nms-agent/bin/nms-agent -config /etc/nms-agent/config.yaml
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=35s
@@ -489,6 +496,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# /var/lib/nms-agent 同时覆盖 .certs 与 bin/（OTA 自更新在 bin/ 写临时二进制做原子替换）
 ReadWritePaths=/var/log/nms-agent /var/lib/nms-agent
 
 [Install]
@@ -519,6 +527,7 @@ tail -f /opt/nms-agent/logs/nms-agent.log   # 或直接查看滚动日志文件
 | 现象 | 原因 | 解决 |
 |------|------|------|
 | `status=1/FAILURE`，日志提示权限错误 | `ProtectSystem=strict` 开启但 `ReadWritePaths` 未配置，Agent 无法写日志或证书 | 在 unit 文件中正确填写 `ReadWritePaths`，列出所有需要写入的目录 |
+| OTA 更新反复失败重启，日志报 `create temp file: ... read-only file system` | 安装目录不可写：OTA 需在可执行文件旁写临时二进制做原子替换，但 `ReadWritePaths` 只放行了 logs/.certs 子目录（或二进制属主不是服务账户） | `systemctl edit nms-agent`，drop-in 中追加 `[Service]` + `ReadWritePaths=<安装目录>`（列表型配置自动与原有合并），保存后 `systemctl restart nms-agent`，下个同步周期自动完成更新 |
 | 证书/日志路径不存在 | 未设 `WorkingDirectory`，config.yaml 中的相对路径被解析到 `/` 下 | 添加 `WorkingDirectory=<安装目录>` 或在 config.yaml 中改用绝对路径 |
 | enrollment 报 `x509: certificate signed by unknown authority` | enroll 端点使用了系统不信任的证书（自签名或私有 CA） | 在 config.yaml 中设置 `insecure_enroll: true`，enrollment 成功后可改回 `false` |
 
