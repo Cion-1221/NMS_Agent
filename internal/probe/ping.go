@@ -10,24 +10,40 @@ import (
 )
 
 func runPing(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
-	results := make([]Result, len(task.Targets))
+	type job struct {
+		target string
+		fp     famProbe
+	}
+	var jobs []job
+	for _, target := range task.Targets {
+		for _, fp := range famProbesFor(task.AddressFamily, target) {
+			jobs = append(jobs, job{target, fp})
+		}
+	}
+
+	results := make([]Result, len(jobs))
 	var wg sync.WaitGroup
-	for i, target := range task.Targets {
-		i, target := i, target
+	for i, j := range jobs {
+		i, j := i, j
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doPing(ctx, task.TaskID, task.Type, target, sourceIPv4, sourceIPv6)
+			results[i] = doPing(ctx, task.TaskID, task.Type, j.target, j.fp, sourceIPv4, sourceIPv6)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doPing(ctx context.Context, taskID int, taskType, target, sourceIPv4, sourceIPv6 string) Result {
-	r := Result{TaskID: taskID, Type: taskType, Target: target}
+func doPing(ctx context.Context, taskID int, taskType, target string, fp famProbe, sourceIPv4, sourceIPv6 string) Result {
+	r := Result{TaskID: taskID, Type: taskType, Target: target + fp.label}
 
 	pinger := probing.New(target)
+	// Restrict domain resolution to the forced family ("ip4"/"ip6"); the
+	// default network "ip" follows system preference (historical behavior).
+	if fp.family != "" {
+		pinger.SetNetwork(fp.family)
+	}
 
 	if err := pinger.Resolve(); err != nil {
 		r.Detail = fmt.Sprintf("resolve: %v", err)

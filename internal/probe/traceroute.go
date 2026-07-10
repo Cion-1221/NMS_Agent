@@ -15,10 +15,10 @@ import (
 )
 
 const (
-	protoICMP     = 1
-	protoICMPv6   = 58
-	traceMaxHops  = 30
-	traceHopWait  = 3 * time.Second
+	protoICMP    = 1
+	protoICMPv6  = 58
+	traceMaxHops = 30
+	traceHopWait = 3 * time.Second
 )
 
 type traceHop struct {
@@ -44,31 +44,31 @@ func runTraceroute(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string
 	// Traceroute runs targets serially: concurrent raw-socket probes on the same
 	// host race for ICMP replies and produce unreliable hop attribution.
 	for _, target := range task.Targets {
-		if ctx.Err() != nil {
-			break
+		for _, fp := range famProbesFor(task.AddressFamily, target) {
+			if ctx.Err() != nil {
+				return results
+			}
+			results = append(results, doTraceroute(ctx, task.TaskID, task.Type, target, fp, sourceIPv4, sourceIPv6))
 		}
-		results = append(results, doTraceroute(ctx, task.TaskID, task.Type, target, sourceIPv4, sourceIPv6))
 	}
 	return results
 }
 
-func doTraceroute(ctx context.Context, taskID int, taskType, target, sourceIPv4, sourceIPv6 string) Result {
-	r := Result{TaskID: taskID, Type: taskType, Target: target}
+func doTraceroute(ctx context.Context, taskID int, taskType, target string, fp famProbe, sourceIPv4, sourceIPv6 string) Result {
+	r := Result{TaskID: taskID, Type: taskType, Target: target + fp.label}
 
 	if runtime.GOOS == "windows" {
 		r.Detail = "traceroute requires raw ICMP sockets; on Windows run the agent as Administrator or use tcpping instead"
 		return r
 	}
 
-	dstIP := net.ParseIP(target)
-	if dstIP == nil {
-		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, target)
-		if err != nil || len(addrs) == 0 {
-			r.Detail = fmt.Sprintf("resolve: %v", err)
-			return r
-		}
-		dstIP = addrs[0].IP
+	// Family-restricted resolution for domain targets (literal IPs pass through).
+	ipStr, err := resolveTargetIP(ctx, target, fp.family)
+	if err != nil {
+		r.Detail = fmt.Sprintf("resolve: %v", err)
+		return r
 	}
+	dstIP := net.ParseIP(ipStr)
 
 	isV4 := dstIP.To4() != nil
 	var params traceParams

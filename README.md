@@ -31,7 +31,7 @@
 - **证书自动续签**：后台 goroutine 每日检查证书有效期，剩余不足 30 天时自动调用 `POST /api/v1/agent-sync/renew-cert` 续签。
 - **Source IP 绑定**：服务端可为每个 Agent 指定出站源 IP（IPv4 或 IPv6），所有探测的发包 socket 均绑定到该地址，确保流量从指定网卡出站。源 IP 变更时探测 goroutine 自动重启，立即生效。
 - **SNMP 探针代理**：服务端把指派给本 Agent 的设备合成为 `snmp_poll` 任务（目标 IP / 凭证 / 周期随任务下发，本地零配置），Agent 采集 RFC 1213 system 组并把结论批量回传 `POST /agent-sync/snmp-results`，驱动服务端的设备运行状态。凭证仅内存持有、不落盘、不入日志。
-- **全协议双栈**：ping、tcpping、httpcheck、dnscheck、traceroute、mtr 均原生支持 IPv4 和 IPv6 目标，无需额外配置。
+- **全协议双栈**：ping、tcpping、httpcheck、dnscheck、traceroute、mtr 均原生支持 IPv4 和 IPv6 目标；域名 target 的解析族由任务级 `address_family`（auto/v4/v6/both）控制，`both` 对每个域名双族各测一次、出两条结果。
 - **批量上报**：探测结果写入内存队列，按批次大小或刷新间隔批量 POST 到服务端，避免高频小请求。
 - **优雅停机**：捕获 `SIGINT`/`SIGTERM`，等待正在执行的探测和上传在宽限期内完成后退出。
 - **跨平台静态编译**：纯 Go + `CGO_ENABLED=0`，单一代码库交叉编译出 Linux / Windows / macOS（amd64 与 arm64）六个平台的静态二进制。
@@ -131,6 +131,8 @@ NMS_Agent/
 \* Windows 下 ICMP ping 通常需要管理员权限或放行防火墙。  
 † httpcheck 的 IPv6 目标 URL 须使用 RFC 3986 括号格式：`http://[2001:db8::1]/path`。  
 ‡ Windows 上 traceroute 和 mtr 任务返回明确的不支持错误结果，不会导致 Agent 崩溃。
+
+**Target 与地址族**：target 可为字面 IPv4/IPv6 地址或域名（tcpping/httpcheck 可带 `:port` 后缀，httpcheck 亦可为完整 `http(s)://` URL）。任务携带的 `address_family` 字段控制**域名**的解析族：缺省/`auto` 跟随系统解析偏好（历史行为）；`v4`/`v6` 限定单族；`both` 对每个域名按两族各探测一次，结果 target 以 ` (v4)`/` (v6)` 后缀区分为两条序列。字面 IP 始终按自身地址族探测一次，不受该字段影响。httpcheck 任务另可携带 `skip_tls_verify`（跳过证书校验，用于裸 IP / 自签证书目标），且无 scheme 前缀的 `host:443`/`host:8443` 默认按 https 探测。
 
 **snmp_poll（SNMP 探针代理）**与其余类型不同：任务由服务端从设备表**逐台合成**（虚拟 TaskID，一台设备一条任务），参数块携带目标 IP、SNMP 版本（v1/v2c/**v3**）、凭证（community 或 v3 的 USM 用户/认证/加密协议与口令）、端口、超时与重试、快慢采集节奏（`inventory_every_n`）、**自定义标量 OID 列表**（`extra_oids`）以及**接口表开关**（`collect_interfaces`——每周期 WALK `ifTable`/`ifXTable` 两个子树，v2c/v3 用 GETBULK、v1 退回 GETNEXT，随结果上报原始计数器由服务端换算速率；WALK 失败不影响本次采集结论）。Agent 每周期只采 `sysUpTime` + 自定义 OID（最小报文，兼做存活判定），每 N 次附带完整 system 组（sysName/sysDescr/sysObjectID/sysLocation/sysContact）；结论走独立队列批量回传 `POST /agent-sync/snmp-results`，每条携带采集时刻 `collected_at`（unix 秒）——服务端以它为 counter 速率换算与时序时间轴的基准，批量攒批不会扭曲速率。v3 的认证失败（USM 错误）显式归类为 `auth_fail` 上报（notInTimeWindow 时间窗重同步除外，gosnmp 自动处理）。多台设备的采集相位按 TaskID 在周期内错开，避免同机房设备被同秒齐射。凭证只存在于内存中的任务快照——每个同步周期从服务端全量重建，从不写盘、不打日志。
 
@@ -258,17 +260,17 @@ certs:
 
 服务端下发的 `source_ip` 变更（包括从有值变为空或反之）会触发所有探测 goroutine 立即重启，在同一个调和周期内以新地址重建连接。
 
-**地址族约束**：`source_ip` 与探测目标必须属于同一地址族。IPv4 源地址配合 IPv6 目标（或反之）会导致 socket 绑定失败；服务端在下发任务时应保证两者一致。
+**地址族约束**：`source_ip` 与探测目标必须属于同一地址族。IPv4 源地址配合 IPv6 目标（或反之）会导致 socket 绑定失败；服务端在下发任务时应保证两者一致。双栈源地址按族分开下发（`source_ipv4`/`source_ipv6`），族限定探测只取对应族的源地址；**某族未配置源地址时该族探测不做绑定、走系统默认路由，不会因缺配而失败**。但 Agent 本身缺少某族出网能力（如无 IPv6 链路）时，`address_family=both` 下该族探测会持续 failed——这是可见的诊断信号，属预期行为而非故障。
 
 ## 双栈支持（IPv4/IPv6）
 
-所有探测均原生支持 IPv4 和 IPv6，无需额外配置开关。各协议的实现细节：
+所有探测均原生支持 IPv4 和 IPv6，无需额外配置开关。域名目标的解析族由任务级 `address_family` 控制（见「探测类型」），各协议的强制方式：ping 用 pro-bing `SetNetwork("ip4"/"ip6")`；tcpping/traceroute 先按族限定 `LookupIP` 解析成字面 IP 再探测；httpcheck 保留 URL 中的域名（Host 头 / TLS SNI 不变），在拨号层用 `tcp4`/`tcp6` 强制族；dnscheck 把族映射为只查 A / 只查 AAAA；mtr 传 `-4`/`-6` 由二进制自行解析。各协议的基础实现细节：
 
 **ping / meshping**  
-`pro-bing` 对目标地址执行 `Resolve()` 后，依据解析结果自动选择 ICMPv4 或 ICMPv6。目标可填 IPv4 字面地址、IPv6 字面地址或域名（域名同时有 A/AAAA 记录时由操作系统决策优先级）。
+`pro-bing` 对目标地址执行 `Resolve()` 后，依据解析结果自动选择 ICMPv4 或 ICMPv6。目标可填 IPv4 字面地址、IPv6 字面地址或域名（`auto` 下域名 A/AAAA 优先级由操作系统决策，可用任务级 `address_family` 强制）。
 
 **tcpping**  
-使用 `net.SplitHostPort` + `net.JoinHostPort` 解析目标，正确处理所有格式：
+使用 `net.SplitHostPort` + `net.JoinHostPort` 解析目标格式（见下表）。域名 host 由 Agent 先按任务地址族显式解析成字面 IP 再拨号——保证实际拨号的地址族与源 IP 绑定选择永远一致（域名有多条记录时取解析结果第一条）：
 
 | 输入格式 | 解析结果 |
 |----------|---------|
@@ -287,7 +289,7 @@ http://2001:db8::1/path          ❌ 不合法，stdlib 解析失败
 ```
 
 **dnscheck**  
-`net.Resolver.LookupIPAddr` 同时返回 A（IPv4）和 AAAA（IPv6）记录，结果中的第一个地址记入 `detail` 字段。DNS 查询通过绑定了 `source_ip` 的 UDP socket 发出，支持 IPv4 和 IPv6 上游 DNS 服务器。
+`net.Resolver.LookupIP` 查询目标域名：`auto` 下同时返回 A+AAAA 记录（等价旧版 `LookupIPAddr` 行为）；`v4`/`v6` 限定为只查 A / 只查 AAAA；`both` 时 A、AAAA 各出一条结果——可用于单独监控某一族解析是否损坏。结果中的第一个地址记入 `detail` 字段。DNS 查询通过绑定了 `source_ip` 的 UDP socket 发出，支持 IPv4 和 IPv6 上游 DNS 服务器。
 
 **traceroute**  
 代码内部按目标地址族分叉：IPv4 目标走 `ip4:icmp`（ICMPv4 Echo + TTL），IPv6 目标走 `ip6:ipv6-icmp`（ICMPv6 EchoRequest + HopLimit）。Source IP 通过 `icmp.ListenPacket(network, sourceIP)` 绑定，对两个地址族均有效。

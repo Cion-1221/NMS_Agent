@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -12,22 +13,46 @@ import (
 )
 
 func runHTTPCheck(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
-	results := make([]Result, len(task.Targets))
+	type job struct {
+		target string
+		fp     famProbe
+	}
+	var jobs []job
+	for _, target := range task.Targets {
+		for _, fp := range famProbesFor(task.AddressFamily, httpTargetHost(target)) {
+			jobs = append(jobs, job{target, fp})
+		}
+	}
+
+	results := make([]Result, len(jobs))
 	var wg sync.WaitGroup
-	for i, target := range task.Targets {
-		i, target := i, target
+	for i, j := range jobs {
+		i, j := i, j
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doHTTPCheck(ctx, task.TaskID, target, sourceIPv4, sourceIPv6)
+			results[i] = doHTTPCheck(ctx, task.TaskID, j.target, j.fp, sourceIPv4, sourceIPv6, task.SkipTLSVerify)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doHTTPCheck(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6 string) Result {
-	r := Result{TaskID: taskID, Type: "httpcheck", Target: target}
+// httpTargetHost extracts the hostname a target will connect to (tolerating a
+// missing scheme and host:port forms). Used only for address-family expansion.
+func httpTargetHost(target string) string {
+	raw := target
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		raw = "http://" + raw
+	}
+	if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return target
+}
+
+func doHTTPCheck(ctx context.Context, taskID int, target string, fp famProbe, sourceIPv4, sourceIPv6 string, skipTLSVerify bool) Result {
+	r := Result{TaskID: taskID, Type: "httpcheck", Target: target + fp.label}
 
 	rawURL := target
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
@@ -48,9 +73,13 @@ func doHTTPCheck(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6
 		return r
 	}
 
-	// Pick source IP matching the address family of the URL host.
+	// Pick source IP: forced family wins; otherwise detect from the URL host.
 	var localAddr net.Addr
-	if src := pickSourceIP(parsedURL.Hostname(), sourceIPv4, sourceIPv6); src != "" {
+	src := sourceIPForFamily(fp.family, sourceIPv4, sourceIPv6)
+	if src == "" && fp.family == "" {
+		src = pickSourceIP(parsedURL.Hostname(), sourceIPv4, sourceIPv6)
+	}
+	if src != "" {
 		localAddr = &net.TCPAddr{IP: net.ParseIP(src)}
 	}
 
@@ -59,10 +88,23 @@ func doHTTPCheck(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6
 		Timeout:   10 * time.Second,
 	}
 
+	// The URL keeps the domain (Host header + TLS SNI stay correct); the
+	// address family is forced at dial time via tcp4/tcp6 instead.
+	dialNetwork := "tcp"
+	switch fp.family {
+	case "ip4":
+		dialNetwork = "tcp4"
+	case "ip6":
+		dialNetwork = "tcp6"
+	}
+
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			DialContext: dialer.DialContext,
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, dialNetwork, addr)
+			},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: skipTLSVerify}, //nolint:gosec // opt-in per task, for bare-IP/self-signed targets
 		},
 	}
 

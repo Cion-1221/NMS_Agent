@@ -42,22 +42,33 @@ func init() {
 }
 
 func runMTR(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
-	results := make([]Result, len(task.Targets))
+	type job struct {
+		target string
+		fp     famProbe
+	}
+	var jobs []job
+	for _, target := range task.Targets {
+		for _, fp := range famProbesFor(task.AddressFamily, target) {
+			jobs = append(jobs, job{target, fp})
+		}
+	}
+
+	results := make([]Result, len(jobs))
 	var wg sync.WaitGroup
-	for i, target := range task.Targets {
-		i, target := i, target
+	for i, j := range jobs {
+		i, j := i, j
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = doMTR(ctx, task.TaskID, task.Type, target, sourceIPv4, sourceIPv6)
+			results[i] = doMTR(ctx, task.TaskID, task.Type, j.target, j.fp, sourceIPv4, sourceIPv6)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func doMTR(ctx context.Context, taskID int, taskType, target, sourceIPv4, sourceIPv6 string) Result {
-	r := Result{TaskID: taskID, Type: taskType, Target: target}
+func doMTR(ctx context.Context, taskID int, taskType, target string, fp famProbe, sourceIPv4, sourceIPv6 string) Result {
+	r := Result{TaskID: taskID, Type: taskType, Target: target + fp.label}
 
 	if runtime.GOOS == "windows" {
 		r.Detail = "mtr is not available on Windows; use traceroute (requires admin) or tcpping instead"
@@ -74,8 +85,19 @@ func doMTR(ctx context.Context, taskID int, taskType, target, sourceIPv4, source
 		"--report-cycles", "10",
 		"--max-ttl", "30",
 	}
+	// Force the resolution family for domain targets; mtr resolves internally.
+	switch fp.family {
+	case "ip4":
+		args = append(args, "-4")
+	case "ip6":
+		args = append(args, "-6")
+	}
 	// mtr --address binds the probe socket; pick the source matching the target family.
-	if src := pickSourceIP(target, sourceIPv4, sourceIPv6); src != "" {
+	src := sourceIPForFamily(fp.family, sourceIPv4, sourceIPv6)
+	if src == "" && fp.family == "" {
+		src = pickSourceIP(target, sourceIPv4, sourceIPv6)
+	}
+	if src != "" {
 		args = append(args, "--address", src)
 	}
 	args = append(args, target)

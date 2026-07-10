@@ -4,6 +4,7 @@ package probe
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"time"
 )
@@ -17,6 +18,15 @@ type Task struct {
 	IntervalSeconds int         `json:"interval_seconds"`
 	Targets         []string    `json:"targets"`
 	SNMP            *SNMPParams `json:"snmp,omitempty"`
+	// SkipTLSVerify: httpcheck only — skip certificate verification (bare-IP
+	// targets or self-signed devices). Ignored by every other task type.
+	SkipTLSVerify bool `json:"skip_tls_verify,omitempty"`
+	// AddressFamily controls how DOMAIN-NAME targets resolve: "" or "auto" =
+	// system resolver preference (historical behavior), "v4"/"v6" = restrict to
+	// that family, "both" = probe v4 and v6 separately (two results per domain,
+	// Result.Target suffixed " (v4)"/" (v6)"). Literal-IP targets always probe
+	// their own family exactly once, regardless of this setting.
+	AddressFamily string `json:"address_family,omitempty"`
 }
 
 // SNMPParams mirrors the "snmp" block the server attaches to snmp_poll tasks.
@@ -119,6 +129,85 @@ func Dispatch(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []R
 	default:
 		return nil
 	}
+}
+
+// famProbe is one per-family expansion of a raw target. family is the Go
+// resolver network ("ip4"/"ip6"); "" means unrestricted (system preference).
+// label is appended to Result.Target so "both" mode yields two distinct
+// result series per domain (series/trend queries key on the target string).
+// The exact " (v4)"/" (v6)" suffix format is a cross-repo contract: the NMS
+// frontend parses it back into a family badge (TabGenericResults renderTarget)
+// — change it there in lockstep or not at all.
+type famProbe struct {
+	family string
+	label  string
+}
+
+// famProbesFor expands one raw target's host part according to the task's
+// address family. Literal-IP hosts always probe once as-is — the family
+// selector only controls how domain names resolve.
+func famProbesFor(addressFamily, host string) []famProbe {
+	if net.ParseIP(host) != nil {
+		return []famProbe{{}}
+	}
+	switch addressFamily {
+	case "v4":
+		return []famProbe{{family: "ip4"}}
+	case "v6":
+		return []famProbe{{family: "ip6"}}
+	case "both":
+		return []famProbe{{family: "ip4", label: " (v4)"}, {family: "ip6", label: " (v6)"}}
+	default: // ""/"auto"/unknown → historical single-probe behavior
+		return []famProbe{{}}
+	}
+}
+
+// resolveTargetIP resolves host to a single literal IP within family
+// ("ip4"/"ip6"; "" = system preference). Literal IPs pass through untouched.
+// Resolving here (instead of at dial time) guarantees the probed address and
+// the source-IP family can never disagree.
+func resolveTargetIP(ctx context.Context, host, family string) (string, error) {
+	if net.ParseIP(host) != nil {
+		return host, nil
+	}
+	network := "ip"
+	if family != "" {
+		network = family
+	}
+	addrs, err := net.DefaultResolver.LookupIP(ctx, network, host)
+	if err != nil {
+		return "", err
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("no %s address for %s", network, host)
+	}
+	return addrs[0].String(), nil
+}
+
+// sourceIPForIP returns the configured source address matching an already-
+// resolved literal target IP ("" when none configured for that family).
+func sourceIPForIP(ipStr, sourceIPv4, sourceIPv6 string) string {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return ""
+	}
+	if ip.To4() != nil {
+		return sourceIPv4
+	}
+	return sourceIPv6
+}
+
+// sourceIPForFamily returns the configured source address for a forced
+// resolution family ("ip4"/"ip6"). Unrestricted family returns "" — callers
+// fall back to per-target family detection (pickSourceIP).
+func sourceIPForFamily(family, sourceIPv4, sourceIPv6 string) string {
+	switch family {
+	case "ip4":
+		return sourceIPv4
+	case "ip6":
+		return sourceIPv6
+	}
+	return ""
 }
 
 // pickSourceIP returns the source IP that matches the address family of host.

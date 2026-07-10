@@ -178,6 +178,12 @@ func taskChanged(old, cur probe.Task) bool {
 	if old.IntervalSeconds != cur.IntervalSeconds || old.Type != cur.Type {
 		return true
 	}
+	if old.SkipTLSVerify != cur.SkipTLSVerify {
+		return true
+	}
+	if old.AddressFamily != cur.AddressFamily {
+		return true
+	}
 	if len(old.Targets) != len(cur.Targets) {
 		return true
 	}
