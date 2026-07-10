@@ -31,7 +31,15 @@ func doHTTPCheck(ctx context.Context, taskID int, target, sourceIPv4, sourceIPv6
 
 	rawURL := target
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-		rawURL = "http://" + rawURL
+		// No explicit scheme: guess from the port so a bare "host:443" target
+		// (the common case) doesn't get sent as plaintext HTTP to a TLS-only
+		// listener and fail with a misleading "EOF". Callers who need something
+		// else (e.g. plain HTTP on 443) can always prefix http:// explicitly.
+		scheme := "http"
+		if _, port, err := net.SplitHostPort(target); err == nil && (port == "443" || port == "8443") {
+			scheme = "https"
+		}
+		rawURL = scheme + "://" + rawURL
 	}
 
 	parsedURL, err := url.Parse(rawURL)
