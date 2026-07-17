@@ -4,34 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 )
 
-func runDNSCheck(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
-	type job struct {
-		target string
-		fp     famProbe
-	}
-	var jobs []job
-	for _, target := range task.Targets {
-		for _, fp := range famProbesFor(task.AddressFamily, target) {
-			jobs = append(jobs, job{target, fp})
-		}
-	}
-
-	results := make([]Result, len(jobs))
-	var wg sync.WaitGroup
-	for i, j := range jobs {
-		i, j := i, j
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = doDNSCheck(ctx, task.TaskID, j.target, j.fp, sourceIPv4, sourceIPv6)
-		}()
-	}
-	wg.Wait()
-	return results
+func runDNSCheck(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string, lim Limiter) []Result {
+	return runJobs(ctx, task, lim, nil, func(ctx context.Context, target string, fp famProbe) Result {
+		return doDNSCheck(ctx, task.TaskID, target, fp, sourceIPv4, sourceIPv6)
+	})
 }
 
 func doDNSCheck(ctx context.Context, taskID int, target string, fp famProbe, sourceIPv4, sourceIPv6 string) Result {

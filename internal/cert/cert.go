@@ -91,28 +91,78 @@ func Enroll(enrollURL, token, hostname, dir string, insecure bool) (string, erro
 	if er.AgentID == "" || er.CertPEM == "" || er.KeyPEM == "" || er.CACertPEM == "" {
 		return "", fmt.Errorf("enroll: incomplete response from server")
 	}
+	// Reject a mismatched pair before touching disk — the provisioning token
+	// is consumed server-side, so bad credentials on disk are unrecoverable.
+	if _, err := tls.X509KeyPair([]byte(er.CertPEM), []byte(er.KeyPEM)); err != nil {
+		return "", fmt.Errorf("enroll: server returned mismatched cert/key: %w", err)
+	}
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create cert dir %s: %w", dir, err)
 	}
 
-	writes := []struct {
-		name    string
-		content string
-		perm    os.FileMode
-	}{
+	files := []credFile{
 		{fileCACert, er.CACertPEM, 0o644},
 		{fileCert, er.CertPEM, 0o644},
 		{fileKey, er.KeyPEM, 0o600},
 		{fileAgentID, er.AgentID + "\n", 0o644},
 	}
-	for _, w := range writes {
-		if err := os.WriteFile(filepath.Join(dir, w.name), []byte(w.content), w.perm); err != nil {
-			return "", fmt.Errorf("write %s: %w", w.name, err)
-		}
+	if err := writeCredFiles(dir, files); err != nil {
+		return "", err
 	}
 
 	return er.AgentID, nil
+}
+
+// credFile is one credential file to persist.
+type credFile struct {
+	name    string
+	content string
+	perm    os.FileMode
+}
+
+// writeCredFiles persists credential files near-atomically: every file is
+// first staged as a temp file in dir, then all are renamed into place. A
+// crash can no longer leave a half-written cert or key; the residual window
+// for a mismatched cert/key pair shrinks from a full file write to the
+// instant between two renames, and NewMTLSClient's startup validation
+// catches that case explicitly.
+func writeCredFiles(dir string, files []credFile) error {
+	tmps := make([]string, len(files))
+	cleanup := func() {
+		for _, t := range tmps {
+			if t != "" {
+				os.Remove(t)
+			}
+		}
+	}
+	for i, f := range files {
+		tmp, err := os.CreateTemp(dir, "."+f.name+".tmp-")
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("stage %s: %w", f.name, err)
+		}
+		tmps[i] = tmp.Name()
+		_, werr := tmp.WriteString(f.content)
+		if cerr := tmp.Close(); werr == nil {
+			werr = cerr
+		}
+		if werr == nil {
+			werr = os.Chmod(tmps[i], f.perm)
+		}
+		if werr != nil {
+			cleanup()
+			return fmt.Errorf("stage %s: %w", f.name, werr)
+		}
+	}
+	for i, f := range files {
+		if err := os.Rename(tmps[i], filepath.Join(dir, f.name)); err != nil {
+			cleanup()
+			return fmt.Errorf("write %s: %w", f.name, err)
+		}
+		tmps[i] = ""
+	}
+	return nil
 }
 
 // LoadAgentID reads the persisted agent ID from the cert directory.
@@ -176,28 +226,19 @@ func Renew(client *http.Client, syncURL, certDir string) error {
 	if rr.CertPEM == "" || rr.KeyPEM == "" {
 		return fmt.Errorf("renew-cert: incomplete response (missing cert or key)")
 	}
+	// Never overwrite a working pair with a mismatched one.
+	if _, err := tls.X509KeyPair([]byte(rr.CertPEM), []byte(rr.KeyPEM)); err != nil {
+		return fmt.Errorf("renew-cert: server returned mismatched cert/key: %w", err)
+	}
 
-	writes := []struct {
-		name    string
-		content string
-		perm    os.FileMode
-	}{
+	files := []credFile{
 		{fileCert, rr.CertPEM, 0o644},
 		{fileKey, rr.KeyPEM, 0o600},
 	}
 	if rr.CACertPEM != "" {
-		writes = append(writes, struct {
-			name    string
-			content string
-			perm    os.FileMode
-		}{fileCACert, rr.CACertPEM, 0o644})
+		files = append(files, credFile{fileCACert, rr.CACertPEM, 0o644})
 	}
-	for _, w := range writes {
-		if err := os.WriteFile(filepath.Join(certDir, w.name), []byte(w.content), w.perm); err != nil {
-			return fmt.Errorf("write %s: %w", w.name, err)
-		}
-	}
-	return nil
+	return writeCredFiles(certDir, files)
 }
 
 // dialMTLS establishes a TLS connection for mTLS, reading the CA cert and client

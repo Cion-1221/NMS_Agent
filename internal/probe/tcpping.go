@@ -4,45 +4,28 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 )
 
-func runTCPPing(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
-	type job struct {
-		target string // original line, used as the Result.Target base
-		host   string
-		port   string
-		fp     famProbe
-	}
-	var jobs []job
-	for _, target := range task.Targets {
-		// Normalise the target into host + port. net.SplitHostPort correctly
-		// handles IPv6 literals in [addr]:port form. A bare address (no port,
-		// including raw IPv6 like "2001:db8::1") causes SplitHostPort to fail,
-		// so we fall back to port 80.
+func runTCPPing(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string, lim Limiter) []Result {
+	return runJobs(ctx, task, lim, tcpTargetHost, func(ctx context.Context, target string, fp famProbe) Result {
 		host, port, err := net.SplitHostPort(target)
 		if err != nil {
-			host = target
-			port = "80"
+			host, port = target, "80"
 		}
-		for _, fp := range famProbesFor(task.AddressFamily, host) {
-			jobs = append(jobs, job{target, host, port, fp})
-		}
-	}
+		return doTCPPing(ctx, task.TaskID, target, host, port, fp, sourceIPv4, sourceIPv6)
+	})
+}
 
-	results := make([]Result, len(jobs))
-	var wg sync.WaitGroup
-	for i, j := range jobs {
-		i, j := i, j
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = doTCPPing(ctx, task.TaskID, j.target, j.host, j.port, j.fp, sourceIPv4, sourceIPv6)
-		}()
+// tcpTargetHost extracts the host part of a target for address-family
+// expansion. net.SplitHostPort correctly handles IPv6 literals in [addr]:port
+// form; a bare address (no port, including raw IPv6 like "2001:db8::1") fails
+// the split and is treated as the host itself (port defaults to 80 at dial).
+func tcpTargetHost(target string) string {
+	if host, _, err := net.SplitHostPort(target); err == nil {
+		return host
 	}
-	wg.Wait()
-	return results
+	return target
 }
 
 func doTCPPing(ctx context.Context, taskID int, target, host, port string, fp famProbe, sourceIPv4, sourceIPv6 string) Result {

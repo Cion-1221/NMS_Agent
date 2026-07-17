@@ -8,34 +8,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
-func runHTTPCheck(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
-	type job struct {
-		target string
-		fp     famProbe
-	}
-	var jobs []job
-	for _, target := range task.Targets {
-		for _, fp := range famProbesFor(task.AddressFamily, httpTargetHost(target)) {
-			jobs = append(jobs, job{target, fp})
-		}
-	}
-
-	results := make([]Result, len(jobs))
-	var wg sync.WaitGroup
-	for i, j := range jobs {
-		i, j := i, j
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = doHTTPCheck(ctx, task.TaskID, j.target, j.fp, sourceIPv4, sourceIPv6, task.SkipTLSVerify)
-		}()
-	}
-	wg.Wait()
-	return results
+func runHTTPCheck(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string, lim Limiter) []Result {
+	return runJobs(ctx, task, lim, httpTargetHost, func(ctx context.Context, target string, fp famProbe) Result {
+		return doHTTPCheck(ctx, task.TaskID, target, fp, sourceIPv4, sourceIPv6, task.SkipTLSVerify)
+	})
 }
 
 // httpTargetHost extracts the hostname a target will connect to (tolerating a
@@ -107,6 +86,9 @@ func doHTTPCheck(ctx context.Context, taskID int, target string, fp famProbe, so
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: skipTLSVerify}, //nolint:gosec // opt-in per task, for bare-IP/self-signed targets
 		},
 	}
+	// The transport is per-probe and discarded on return; close its keep-alive
+	// connections so file handles don't accumulate until GC on busy tasks.
+	defer client.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {

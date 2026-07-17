@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -39,16 +39,22 @@ type traceParams struct {
 	proto    int
 }
 
-func runTraceroute(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
+// traceID hands out a distinct ICMP echo identifier per traceroute run so
+// concurrent traceroute tasks in this process cannot claim each other's replies.
+var traceID atomic.Uint32
+
+func runTraceroute(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string, lim Limiter) []Result {
 	results := make([]Result, 0, len(task.Targets))
 	// Traceroute runs targets serially: concurrent raw-socket probes on the same
 	// host race for ICMP replies and produce unreliable hop attribution.
 	for _, target := range task.Targets {
 		for _, fp := range famProbesFor(task.AddressFamily, target) {
-			if ctx.Err() != nil {
+			if !lim.Acquire(ctx) {
 				return results
 			}
-			results = append(results, doTraceroute(ctx, task.TaskID, task.Type, target, fp, sourceIPv4, sourceIPv6))
+			r := stamp(doTraceroute(ctx, task.TaskID, task.Type, target, fp, sourceIPv4, sourceIPv6))
+			lim.Release()
+			results = append(results, r)
 		}
 	}
 	return results
@@ -98,7 +104,7 @@ func doTraceroute(ctx context.Context, taskID int, taskType, target string, fp f
 	}
 	defer conn.Close()
 
-	id := os.Getpid() & 0xffff
+	id := int(traceID.Add(1) & 0xffff)
 	dstAddr := &net.IPAddr{IP: dstIP}
 	var detail traceDetail
 
@@ -164,12 +170,43 @@ func probeHop(conn *icmp.PacketConn, dst net.Addr, params traceParams, ttl, id i
 
 		switch body := rm.Body.(type) {
 		case *icmp.TimeExceeded:
-			_ = body
-			return peer.String(), rtt, false
+			// Only accept expirations of OUR probe: the payload embeds the
+			// original IP header + first 8 bytes of the echo we sent, which
+			// carry its ID and sequence number.
+			if matchesEcho(body.Data, params.isV4, id, ttl) {
+				return peer.String(), rtt, false
+			}
 		case *icmp.Echo:
-			if body.ID == id {
+			if body.ID == id && body.Seq == ttl {
 				return peer.String(), rtt, false
 			}
 		}
 	}
+}
+
+// matchesEcho reports whether a TimeExceeded payload embeds the echo request
+// identified by id/seq. The payload starts with the original IP header
+// (variable-length IHL for IPv4, fixed 40 bytes for IPv6 — our probes carry
+// no extension headers) followed by at least 8 bytes of the original ICMP
+// message, whose ID sits at offset 4-5 and Seq at 6-7 (big-endian).
+func matchesEcho(data []byte, isV4 bool, id, seq int) bool {
+	var inner []byte
+	if isV4 {
+		if len(data) < 1 {
+			return false
+		}
+		ihl := int(data[0]&0x0f) * 4
+		if ihl < 20 || len(data) < ihl+8 {
+			return false
+		}
+		inner = data[ihl:]
+	} else {
+		if len(data) < 40+8 {
+			return false
+		}
+		inner = data[40:]
+	}
+	embID := int(inner[4])<<8 | int(inner[5])
+	embSeq := int(inner[6])<<8 | int(inner[7])
+	return embID == id && embSeq == seq
 }

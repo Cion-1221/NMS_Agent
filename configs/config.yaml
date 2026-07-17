@@ -46,6 +46,8 @@ runtime:
     # Use an absolute path to avoid resolution issues when the working directory
     # differs from the install location (e.g. when running via systemd or nohup).
     file: "logs/nms-agent.log"
+    # level: log verbosity — debug / info / warn / error (default info).
+    level: "info"
     # max_size_mb: rotate when the file reaches this size (lumberjack).
     max_size_mb: 100
     # max_age_days: delete rotated files older than this many days.

@@ -1,146 +1,165 @@
 # NMS Agent
 
-部署在分布式边缘节点（机房 / POP）上的网络探测 Agent。启动后自动向 NMS Server 申请 mTLS 证书，随后持续轮询服务端下发的探测任务（ping、tcpping、httpcheck、dnscheck、traceroute、mtr），将结果批量上传回服务端。所有探测目标、探测类型、执行周期均由服务端动态下发，本地配置只需填写身份信息和服务端地址。
+部署在分布式边缘节点（机房 / POP）上的网络探测 Agent。首次启动用一次性 provisioning token 向 NMS Server 申请 mTLS 证书，之后持续轮询服务端下发的探测任务（ping、tcpping、httpcheck、dnscheck、traceroute、mtr、snmp_poll），把结果批量回传服务端。探测目标、类型、周期、源 IP 绑定、软件升级全部由服务端动态驱动 —— 本地配置只需要身份信息和服务端地址。
 
 [![Build and Release](https://github.com/Cion-1221/NMS_Agent/actions/workflows/release.yml/badge.svg)](https://github.com/Cion-1221/NMS_Agent/actions/workflows/release.yml)
 ![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)
 ![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20windows%20%7C%20macOS-lightgrey)
 
-## 目录
+---
 
-- [核心特性](#核心特性)
-- [架构设计](#架构设计)
-- [目录结构](#目录结构)
-- [探测类型](#探测类型)
-- [快速开始](#快速开始)
-- [配置说明](#配置说明)
-- [证书工作流](#证书工作流)
-- [Source IP 绑定](#source-ip-绑定)
-- [双栈支持（IPv4/IPv6）](#双栈支持ipv4ipv6)
-- [安全设计](#安全设计)
-- [构建与发布](#构建与发布)
-- [配置 systemd 服务常驻](#配置-systemd-服务常驻)
-- [平台限制](#平台限制)
-- [License](#license)
+## 📖 目录
 
-## 核心特性
+- **[1. 项目概览](#1-项目概览)**
+  - [1.1 一句话架构](#11-一句话架构)
+  - [1.2 核心特性一览](#12-核心特性一览)
+  - [1.3 架构图](#13-架构图)
+  - [1.4 目录结构](#14-目录结构)
+- **[2. 快速开始](#2-快速开始)**
+  - [2.1 下载预编译二进制](#21-下载预编译二进制)
+  - [2.2 从源码构建](#22-从源码构建)
+  - [2.3 命令行参数](#23-命令行参数)
+  - [2.4 验证启动](#24-验证启动)
+- **[3. 配置说明](#3-配置说明)**
+  - [3.1 agent 块 — 身份](#31-agent-块--身份)
+  - [3.2 server 块 — 服务端与同步节奏](#32-server-块--服务端与同步节奏)
+  - [3.3 runtime 块 — 日志与运行时](#33-runtime-块--日志与运行时)
+  - [3.4 certs 块 — 证书目录](#34-certs-块--证书目录)
+  - [3.5 敏感信息与环境变量](#35-敏感信息与环境变量)
+- **[4. 功能模块](#4-功能模块)**（一个菜单一个功能）
+  - [4.1 证书与身份 — internal/cert](#41-证书与身份--internalcert)
+  - [4.2 任务调度 — internal/scheduler](#42-任务调度--internalscheduler)
+  - [4.3 探测引擎 — internal/probe](#43-探测引擎--internalprobe)
+    - [4.3.1 ping / meshping](#431-ping--meshping)
+    - [4.3.2 tcpping](#432-tcpping)
+    - [4.3.3 httpcheck](#433-httpcheck)
+    - [4.3.4 dnscheck](#434-dnscheck)
+    - [4.3.5 traceroute](#435-traceroute)
+    - [4.3.6 mtr / meshmtr](#436-mtr--meshmtr)
+    - [4.3.7 snmp_poll — SNMP 探针代理](#437-snmp_poll--snmp-探针代理)
+  - [4.4 结果上报 — internal/reporter](#44-结果上报--internalreporter)
+  - [4.5 OTA 自动升级 — internal/updater](#45-ota-自动升级--internalupdater)
+  - [4.6 结构化日志 — internal/logger](#46-结构化日志--internallogger)
+  - [4.7 公网 IP 自发现 — main.go](#47-公网-ip-自发现--maingo)
+- **[5. 高级主题](#5-高级主题)**
+  - [5.1 Source IP 绑定](#51-source-ip-绑定)
+  - [5.2 双栈 IPv4/IPv6 与 address_family](#52-双栈-ipv4ipv6-与-address_family)
+  - [5.3 安全设计](#53-安全设计)
+- **[6. 部署运维](#6-部署运维)**
+  - [6.1 systemd 方式一：自包含目录（root）](#61-systemd-方式一自包含目录root)
+  - [6.2 systemd 方式二：专用账户（生产推荐）](#62-systemd-方式二专用账户生产推荐)
+  - [6.3 Windows 部署注意事项](#63-windows-部署注意事项)
+  - [6.4 常用管理命令](#64-常用管理命令)
+  - [6.5 故障排查](#65-故障排查)
+- **[7. 构建与发布（CI）](#7-构建与发布ci)**
+- **[8. 平台支持矩阵](#8-平台支持矩阵)**
+- **[9. 服务端 API 契约](#9-服务端-api-契约)**
+- **[10. License](#10-license)**
 
-- **服务端驱动**：探测目标、类型、周期全部由服务端 `GET /api/v1/agent-sync/tasks` 下发；本地配置仅含身份信息与服务端地址，无需重启即可调整探测策略。
-- **mTLS 双向认证**：首次启动时用一次性 provisioning token 向服务端申请证书，后续所有通信（任务拉取、结果上传、证书续签）走互相验证的 mTLS 通道。
-- **证书热更新**：mTLS 客户端使用 `GetClientCertificate` 回调，续签后的证书在下一次 TLS 握手时即时生效，无需重启。
-- **证书自动续签**：后台 goroutine 每日检查证书有效期，剩余不足 30 天时自动调用 `POST /api/v1/agent-sync/renew-cert` 续签。
-- **Source IP 绑定**：服务端可为每个 Agent 指定出站源 IP（IPv4 或 IPv6），所有探测的发包 socket 均绑定到该地址，确保流量从指定网卡出站。源 IP 变更时探测 goroutine 自动重启，立即生效。
-- **SNMP 探针代理**：服务端把指派给本 Agent 的设备合成为 `snmp_poll` 任务（目标 IP / 凭证 / 周期随任务下发，本地零配置），Agent 采集 RFC 1213 system 组并把结论批量回传 `POST /agent-sync/snmp-results`，驱动服务端的设备运行状态。凭证仅内存持有、不落盘、不入日志。
-- **全协议双栈**：ping、tcpping、httpcheck、dnscheck、traceroute、mtr 均原生支持 IPv4 和 IPv6 目标；域名 target 的解析族由任务级 `address_family`（auto/v4/v6/both）控制，`both` 对每个域名双族各测一次、出两条结果。
-- **批量上报**：探测结果写入内存队列，按批次大小或刷新间隔批量 POST 到服务端，避免高频小请求。
-- **优雅停机**：捕获 `SIGINT`/`SIGTERM`，等待正在执行的探测和上传在宽限期内完成后退出。
-- **跨平台静态编译**：纯 Go + `CGO_ENABLED=0`，单一代码库交叉编译出 Linux / Windows / macOS（amd64 与 arm64）六个平台的静态二进制。
+---
 
-## 架构设计
+## 1. 项目概览
+
+### 1.1 一句话架构
+
+**服务端驱动的瘦探针**：Agent 本地零业务配置，每 `task_poll_interval` 拉取一次任务清单，diff 式增删探测协程；结果攒批经 mTLS 通道回传；证书续签、源 IP 变更、版本升级全部在同一条同步链路上完成，无需人工登录节点。
+
+### 1.2 核心特性一览
+
+| # | 特性 | 说明 |
+|---|------|------|
+| 1 | **服务端驱动** | 探测目标 / 类型 / 周期由 `GET /agent-sync/tasks` 下发，调整策略无需重启 Agent |
+| 2 | **mTLS 双向认证** | 首启用 provisioning token 换证书，之后所有通信走双向验证的 mTLS 通道 |
+| 3 | **证书热更新** | mTLS 客户端通过 `DialTLSContext` 在每次新建 TLS 连接时从磁盘重读证书，续签 / CA 轮换即时生效、零重启 |
+| 4 | **证书自动续签** | 每日检查有效期，剩余 < 30 天自动调用 `renew-cert` 续签 |
+| 5 | **Source IP 绑定** | 服务端按族下发 `source_ipv4` / `source_ipv6`，所有探测 socket 绑定指定源地址；变更即全量重启探测协程 |
+| 6 | **全协议双栈** | 7 种探测原生支持 IPv4/IPv6；域名解析族由任务级 `address_family`（auto/v4/v6/both）控制 |
+| 7 | **SNMP 探针代理** | 服务端把指派设备合成 `snmp_poll` 任务（目标/凭证/节奏随任务下发），支持 v1/v2c/v3、自定义 OID、接口表采集；凭证仅内存持有 |
+| 8 | **OTA 自动升级** | 服务端在任务响应中携带 `update` 指令，Agent 优雅停机 → 下载校验 SHA-256 → 原子替换二进制 → 原地重启 |
+| 9 | **批量上报 + 失败重试** | 双内存队列（探测 / SNMP）攒批，按批次大小或刷新间隔上传；失败批次保留缓冲、指数退避重试，不再整批丢弃 |
+| 10 | **公网 IP 自发现** | 强制 tcp4/tcp6 各连一次服务端 `/my-ip` 反射端点，穿透云 NAT 上报真实公网双栈地址 |
+| 11 | **优雅停机** | 捕获 SIGINT/SIGTERM，宽限期内等待在途探测与上传完成 |
+| 12 | **跨平台静态编译** | 纯 Go + `CGO_ENABLED=0`，一套代码交叉编译 Linux / Windows / macOS × amd64 / arm64 |
+
+### 1.3 架构图
 
 ```
-  ┌──────────────────────────────────────────────────────┐
-  │                    NMS Server                         │
-  │                                                        │
-  │  :8443  POST /api/v1/agents/enroll  (一次性，单向 TLS) │
-  │  :8444  GET  /api/v1/agent-sync/tasks        (mTLS)   │
-  │  :8444  POST /api/v1/agent-sync/results      (mTLS)   │
-  │  :8444  POST /api/v1/agent-sync/snmp-results (mTLS)   │
-  │  :8444  POST /api/v1/agent-sync/renew-cert   (mTLS)   │
-  └────────────────────┬─────────────────────────────────┘
-                        │
-              mTLS + X-Agent-Version header
-                        │
-  ┌─────────────────────▼─────────────────────────────────┐
-  │  main.go                                               │
-  │   1. 加载 configs/config.yaml                          │
-  │   2. 证书检查 → 首次 enroll → 初始化 mTLS 客户端        │
-  │   3. 启动 cert renewal goroutine（每日检查）             │
-  │   4. 启动 Reporter + Scheduler                         │
-  └──────┬──────────────────────────────┬─────────────────┘
-         │                              │
-  ┌──────▼──────────┐         ┌─────────▼──────────────┐
-  │   Scheduler      │         │      Reporter           │
-  │ 每隔 poll_interval│ probe   │ 内存队列攒批            │
-  │ 拉取任务，diff 式 │ Results │ 按批次大小 / 刷新间隔   │
-  │ 管理 probe 协程  │ ──────> │ POST /results           │
-  └──────┬──────────┘         └────────────────────────┘
-         │  并发信号量（max_concurrency）
-  ┌──────▼──────────────────────────────────────────────┐
-  │  internal/probe/                                     │
-  │   probe.go     — Dispatch() 路由到对应实现            │
-  │   ping.go      — ICMP（pro-bing，source IP 绑定）     │
-  │   tcpping.go   — TCP 拨号（net.Dialer.LocalAddr）    │
-  │   httpcheck.go — HTTP(S)（Transport.DialContext）    │
-  │   dnscheck.go  — DNS（net.Resolver，UDP bind）       │
-  │   traceroute.go— 原始 ICMP 套接字（Linux/macOS）     │
-  │   mtr.go       — 调用系统 mtr 二进制（Linux/macOS）  │
-  │   snmp.go      — SNMP v1/v2c GET（gosnmp，代理采集） │
-  └─────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────┐
+  │                        NMS Server                          │
+  │  :8443  POST /api/v1/agents/enroll        (一次性，单向 TLS)│
+  │  :8444  GET  /api/v1/agent-sync/tasks             (mTLS)  │
+  │  :8444  POST /api/v1/agent-sync/results           (mTLS)  │
+  │  :8444  POST /api/v1/agent-sync/snmp-results      (mTLS)  │
+  │  :8444  POST /api/v1/agent-sync/renew-cert        (mTLS)  │
+  │  :8444  GET  /api/v1/agent-sync/my-ip             (mTLS)  │
+  │  :8444  GET  /api/v1/agent-sync/binary/{id}       (mTLS)  │
+  └───────────────────────────┬───────────────────────────────┘
+                              │ mTLS
+                              │ + X-Agent-Version / OS / Arch / IPv4 / IPv6 头
+  ┌───────────────────────────▼───────────────────────────────┐
+  │  main.go                                                   │
+  │   1. 加载 configs/config.yaml                              │
+  │   2. 证书检查 → 首次 enroll → 初始化 mTLS 客户端             │
+  │   3. 后台协程：证书续签（每日）+ 公网 IP 刷新（每 24h）        │
+  │   4. 启动 Reporter + Scheduler；等待信号或 OTA 指令          │
+  └────────┬──────────────────────────────────┬───────────────┘
+           │                                  │
+  ┌────────▼───────────┐            ┌─────────▼───────────────┐
+  │     Scheduler       │  Results   │        Reporter          │
+  │ 每 poll_interval 拉  │ ─────────> │ 双队列攒批（probe/SNMP）  │
+  │ 任务，diff 式管理    │  SNMP      │ 按 batch_size 或         │
+  │ 探测协程；透传 OTA   │  Results   │ flush_interval 批量 POST │
+  └────────┬───────────┘            └─────────────────────────┘
+           │ 并发信号量（max_concurrency）
+  ┌────────▼──────────────────────────────────────────────────┐
+  │  internal/probe/                                           │
+  │   probe.go      — Dispatch() 按 type 路由 + 双栈族展开       │
+  │   ping.go       — ICMP（pro-bing，source IP 绑定）          │
+  │   tcpping.go    — TCP 拨号（net.Dialer.LocalAddr）          │
+  │   httpcheck.go  — HTTP(S)（Transport.DialContext 强制族）   │
+  │   dnscheck.go   — DNS（net.Resolver，UDP 源绑定）           │
+  │   traceroute.go — 原始 ICMP 套接字（Linux/macOS）            │
+  │   mtr.go        — 调用系统 mtr 二进制（Linux/macOS）         │
+  │   snmp.go       — SNMP v1/v2c/v3（gosnmp，代理采集）        │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-**任务调和逻辑**：`Scheduler` 维护一个 `map[taskID]*taskRunner`。每次从服务端拉取任务后，取消服务端已移除的任务对应的 goroutine，为新增任务启动 goroutine，已有任务保持不变（不重启）。若服务端返回的 `source_ip` 发生变化，则取消所有运行中的 goroutine，在同一轮调和中重新启动，以使新的 IP 绑定立即生效。
-
-## 目录结构
+### 1.4 目录结构
 
 ```
 NMS_Agent/
 ├── go.mod / go.sum
-├── main.go                       # 入口：配置 / 证书 / mTLS 客户端 / 启动
+├── main.go                      # 入口：配置 / 证书 / mTLS / 后台协程 / OTA 编排
 ├── configs/
-│   └── config.yaml               # Bootstrap 配置（4 个顶级块）
-├── .certs/                       # 证书目录（运行时生成，不提交版本库）
-│   ├── ca.crt                    # 服务端 CA 证书
-│   ├── client.crt                # Agent 客户端证书
-│   ├── client.key                # Agent 私钥（权限 0600）
-│   └── agent_id                  # 服务端分配的 AgentID
-├── logs/                         # 日志目录（运行时生成）
+│   └── config.yaml              # Bootstrap 配置（4 个顶级块）
+├── .certs/                      # 证书目录（运行时生成，勿提交版本库）
+│   ├── ca.crt                   #   服务端 CA 证书
+│   ├── client.crt               #   Agent 客户端证书
+│   ├── client.key               #   Agent 私钥（0600）
+│   └── agent_id                 #   服务端分配的 AgentID
+├── logs/                        # 日志目录（运行时生成）
 ├── .github/workflows/
-│   └── release.yml               # 打 Tag 自动交叉编译并发布 Release
+│   └── release.yml              # 打 v* Tag 自动交叉编译 + 发布 Release
 └── internal/
-    ├── cert/cert.go              # 证书生命周期：enroll / expiry / renew / mTLS 客户端
-    ├── config/config.go          # viper 加载 + 配置结构体
-    ├── logger/logger.go          # slog JSON 日志 + lumberjack 文件轮转
-    ├── probe/                    # 所有探测实现（同一个 package）
-    │   ├── probe.go              #   Dispatch()：task type → 实现路由
-    │   ├── ping.go               #   ICMP Ping
-    │   ├── tcpping.go            #   TCP 端口可达性
-    │   ├── httpcheck.go          #   HTTP(S) 健康检查
-    │   ├── dnscheck.go           #   DNS 解析探测
-    │   ├── traceroute.go         #   逐跳路由追踪
-    │   ├── mtr.go                #   MTR（调用系统二进制）
-    │   └── snmp.go               #   SNMP 代理采集（system 组，快/慢两档）
-    ├── reporter/reporter.go      # 攒批 + HTTP POST 到 /results 与 /snmp-results（双队列）
-    └── scheduler/scheduler.go   # 任务拉取 + diff 式协程管理（snmp_poll 带启动错峰）
+    ├── cert/cert.go             # 证书生命周期：enroll / 到期检查 / renew / mTLS 客户端
+    ├── config/config.go         # viper 加载 + 默认值 + 校验
+    ├── logger/logger.go         # slog JSON + lumberjack 轮转 + 每日零点切割
+    ├── probe/                   # 7 种探测实现（同一 package）
+    ├── reporter/reporter.go     # 双队列攒批上传（results / snmp-results）
+    ├── scheduler/scheduler.go   # 任务拉取 + diff 式协程管理 + OTA 指令透传
+    └── updater/
+        ├── updater.go           # 下载 / SHA-256 校验 / 原子替换二进制
+        ├── restart_unix.go      # Linux/macOS：syscall.Exec 原地换像（PID 不变）
+        └── restart_windows.go   # Windows：干净退出，交由服务管理器重启
 ```
 
-## 探测类型
+---
 
-所有探测类型均由服务端在任务列表中指定，本地配置中不声明。
+## 2. 快速开始
 
-| type 字段 | 协议 / 工具 | IPv4 | IPv6 | Linux | Windows | macOS |
-|-----------|------------|:----:|:----:|:-----:|:-------:|:-----:|
-| `ping` / `meshping` | ICMP（pro-bing） | ✅ | ✅ | ✅ | ✅* | ✅ |
-| `tcpping` | TCP | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `httpcheck` | HTTP(S) | ✅ | ✅† | ✅ | ✅ | ✅ |
-| `dnscheck` | DNS UDP | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `traceroute` | 原始 ICMP | ✅ | ✅ | ✅ | ❌‡ | ✅ |
-| `mtr` | `mtr` 二进制 | ✅ | ✅ | ✅ | ❌‡ | ✅ |
-| `snmp_poll` | SNMP v1/v2c UDP（gosnmp） | ✅ | ✅ | ✅ | ✅ | ✅ |
+### 2.1 下载预编译二进制
 
-\* Windows 下 ICMP ping 通常需要管理员权限或放行防火墙。  
-† httpcheck 的 IPv6 目标 URL 须使用 RFC 3986 括号格式：`http://[2001:db8::1]/path`。  
-‡ Windows 上 traceroute 和 mtr 任务返回明确的不支持错误结果，不会导致 Agent 崩溃。
-
-**Target 与地址族**：target 可为字面 IPv4/IPv6 地址或域名（tcpping/httpcheck 可带 `:port` 后缀，httpcheck 亦可为完整 `http(s)://` URL）。任务携带的 `address_family` 字段控制**域名**的解析族：缺省/`auto` 跟随系统解析偏好（历史行为）；`v4`/`v6` 限定单族；`both` 对每个域名按两族各探测一次，结果 target 以 ` (v4)`/` (v6)` 后缀区分为两条序列。字面 IP 始终按自身地址族探测一次，不受该字段影响。httpcheck 任务另可携带 `skip_tls_verify`（跳过证书校验，用于裸 IP / 自签证书目标），且无 scheme 前缀的 `host:443`/`host:8443` 默认按 https 探测。
-
-**snmp_poll（SNMP 探针代理）**与其余类型不同：任务由服务端从设备表**逐台合成**（虚拟 TaskID，一台设备一条任务），参数块携带目标 IP、SNMP 版本（v1/v2c/**v3**）、凭证（community 或 v3 的 USM 用户/认证/加密协议与口令）、端口、超时与重试、快慢采集节奏（`inventory_every_n`）、**自定义标量 OID 列表**（`extra_oids`）以及**接口表开关**（`collect_interfaces`——每周期 WALK `ifTable`/`ifXTable` 两个子树，v2c/v3 用 GETBULK、v1 退回 GETNEXT，随结果上报原始计数器由服务端换算速率；WALK 失败不影响本次采集结论）。Agent 每周期只采 `sysUpTime` + 自定义 OID（最小报文，兼做存活判定），每 N 次附带完整 system 组（sysName/sysDescr/sysObjectID/sysLocation/sysContact）；结论走独立队列批量回传 `POST /agent-sync/snmp-results`，每条携带采集时刻 `collected_at`（unix 秒）——服务端以它为 counter 速率换算与时序时间轴的基准，批量攒批不会扭曲速率。v3 的认证失败（USM 错误）显式归类为 `auth_fail` 上报（notInTimeWindow 时间窗重同步除外，gosnmp 自动处理）。多台设备的采集相位按 TaskID 在周期内错开，避免同机房设备被同秒齐射。凭证只存在于内存中的任务快照——每个同步周期从服务端全量重建，从不写盘、不打日志。
-
-## 快速开始
-
-### 方式一：下载预编译二进制
-
-从 [Releases](https://github.com/Cion-1221/NMS_Agent/releases) 下载对应平台的压缩包（`nms-agent_<version>_<os>_<arch>.{tar.gz|zip}`），解压后内含二进制、示例配置与 README：
+从 [Releases](https://github.com/Cion-1221/NMS_Agent/releases) 下载对应平台压缩包（`nms-agent_<version>_<os>_<arch>.{tar.gz|zip}`），内含二进制、示例配置与本 README：
 
 ```bash
 tar -xzf nms-agent_1.0.0_linux_amd64.tar.gz
@@ -149,13 +168,13 @@ cd nms-agent_1.0.0_linux_amd64
 # 编辑配置：填写 enroll_url、report_url、provisioning_token
 vim configs/config.yaml
 
-# 首次运行自动 enroll，获取证书后进入正常运行模式
+# 首次运行自动 enroll，拿到证书后进入正常运行模式
 ./nms-agent -config configs/config.yaml
 ```
 
-### 方式二：从源码构建
+### 2.2 从源码构建
 
-要求 Go 1.25 及以上。
+要求 Go 1.25+：
 
 ```bash
 git clone https://github.com/Cion-1221/NMS_Agent.git
@@ -164,16 +183,16 @@ go build -o nms-agent .
 ./nms-agent -config configs/config.yaml
 ```
 
-### 命令行参数
+### 2.3 命令行参数
 
 ```
 nms-agent -config <path>   指定配置文件路径（默认 configs/config.yaml）
 nms-agent -version         打印版本 / commit / 构建时间后退出
 ```
 
-### 验证启动
+### 2.4 验证启动
 
-成功启动后会输出 JSON 结构化日志：
+成功启动输出 JSON 结构化日志：
 
 ```json
 {"time":"...","level":"INFO","msg":"nms-agent starting","version":"1.0.0","region":"HKG"}
@@ -182,187 +201,268 @@ nms-agent -version         打印版本 / commit / 构建时间后退出
 {"time":"...","level":"INFO","msg":"scheduler: task started","task_id":1,"type":"ping","interval_s":30}
 ```
 
-按 `Ctrl+C`（或 `kill -TERM <pid>`）触发优雅停机。
-
-## 配置说明
-
-完整示例见 [`configs/config.yaml`](configs/config.yaml)，分为四个顶级块：
-
-```yaml
-agent:
-  id: ""                        # 留空；enrollment 后从 .certs/agent_id 读取
-  region: "HKG"                 # 区域标识，随结果一并上报
-  tags:
-    role: "edge"
-    datacenter: "DC1"
-  hostname_override: ""         # 留空时使用 os.Hostname()
-
-server:
-  enroll_url: "https://nms.example.com:8443"    # 单向 TLS，仅首次 enroll 使用
-  report_url: "https://nms.example.com:8444"    # mTLS，任务拉取 + 结果上传
-  provisioning_token: "${NMS_TOKEN}"            # 一次性 token，enroll 后可清空
-  insecure_enroll: false        # 仅在 enroll 端点使用自签名证书时设 true
-  task_poll_interval: "30s"     # 拉取任务列表的间隔
-  flush_interval: "30s"         # 结果上传的最大等待时间
-  batch_size: 100               # 攒够此数量立即上传（不等 flush_interval）
-  request_timeout: "30s"        # 单次 HTTP 请求超时
-
-runtime:
-  log:
-    file: "logs/nms-agent.log"  # 留空则输出到 stderr
-    max_size_mb: 100            # 按大小轮转
-    max_age_days: 30            # 保留天数
-    max_backups: 30             # 保留文件数
-    compress: true              # gzip 压缩旧日志
-  grace_period: "30s"           # SIGTERM 后等待探测/上传完成的最长时间
-  max_concurrency: 20           # 同时执行的探测任务上限
-
-certs:
-  dir: ".certs"                 # 证书存放目录（含 ca.crt / client.crt / client.key / agent_id）
-```
-
-**敏感信息处理**：`provisioning_token` 等字段支持 `${ENV_VAR}` 占位符，在启动时从环境变量展开，配置文件本身可安全提交版本库。推荐通过 systemd `EnvironmentFile=` 或容器 Secret 注入。
-
-## 证书工作流
-
-```
-首次启动
-  └─ .certs/ 不存在或不完整
-       └─ POST /api/v1/agents/enroll（单向 HTTPS，带 provisioning_token）
-            └─ 写入 ca.crt、client.crt、client.key（0600）、agent_id
-               └─ 初始化 mTLS 客户端，进入正常运行
-
-后续启动
-  └─ .certs/ 存在
-       └─ 读取 agent_id，直接初始化 mTLS 客户端
-
-证书热更新（运行中）
-  ├─ 后台 goroutine 每 24h 检查 client.crt 有效期
-  ├─ 剩余 < 30 天 → POST /api/v1/agent-sync/renew-cert（mTLS）
-  │    └─ 服务端返回新 cert/key，覆盖写入磁盘
-  └─ 下一次 TLS 握手自动加载新证书（GetClientCertificate 回调）
-       └─ 无需重启 Agent
-```
-
-## Source IP 绑定
-
-服务端在任务响应中携带 `source_ip` 字段（可为空，支持 IPv4 或 IPv6）。Agent 将其传递给所有探测函数，各协议的绑定方式如下：
-
-| 协议 | 绑定实现 |
-|------|---------|
-| ICMP（ping） | `pinger.Source = sourceIP` |
-| TCP（tcpping / httpcheck） | `net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP(sourceIP)}}` |
-| DNS（dnscheck） | `net.Resolver{Dial: func() { net.Dialer{LocalAddr: &net.UDPAddr{IP: ...}} }}` |
-| 原始 ICMP（traceroute） | `icmp.ListenPacket(network, sourceIP)` |
-| mtr | `mtr --address sourceIP` |
-
-`source_ip` 为空时各探测使用操作系统默认路由出站接口，行为与普通工具一致。
-
-服务端下发的 `source_ip` 变更（包括从有值变为空或反之）会触发所有探测 goroutine 立即重启，在同一个调和周期内以新地址重建连接。
-
-**地址族约束**：`source_ip` 与探测目标必须属于同一地址族。IPv4 源地址配合 IPv6 目标（或反之）会导致 socket 绑定失败；服务端在下发任务时应保证两者一致。双栈源地址按族分开下发（`source_ipv4`/`source_ipv6`），族限定探测只取对应族的源地址；**某族未配置源地址时该族探测不做绑定、走系统默认路由，不会因缺配而失败**。但 Agent 本身缺少某族出网能力（如无 IPv6 链路）时，`address_family=both` 下该族探测会持续 failed——这是可见的诊断信号，属预期行为而非故障。
-
-## 双栈支持（IPv4/IPv6）
-
-所有探测均原生支持 IPv4 和 IPv6，无需额外配置开关。域名目标的解析族由任务级 `address_family` 控制（见「探测类型」），各协议的强制方式：ping 用 pro-bing `SetNetwork("ip4"/"ip6")`；tcpping/traceroute 先按族限定 `LookupIP` 解析成字面 IP 再探测；httpcheck 保留 URL 中的域名（Host 头 / TLS SNI 不变），在拨号层用 `tcp4`/`tcp6` 强制族；dnscheck 把族映射为只查 A / 只查 AAAA；mtr 传 `-4`/`-6` 由二进制自行解析。各协议的基础实现细节：
-
-**ping / meshping**  
-`pro-bing` 对目标地址执行 `Resolve()` 后，依据解析结果自动选择 ICMPv4 或 ICMPv6。目标可填 IPv4 字面地址、IPv6 字面地址或域名（`auto` 下域名 A/AAAA 优先级由操作系统决策，可用任务级 `address_family` 强制）。
-
-**tcpping**  
-使用 `net.SplitHostPort` + `net.JoinHostPort` 解析目标格式（见下表）。域名 host 由 Agent 先按任务地址族显式解析成字面 IP 再拨号——保证实际拨号的地址族与源 IP 绑定选择永远一致（域名有多条记录时取解析结果第一条）：
-
-| 输入格式 | 解析结果 |
-|----------|---------|
-| `192.168.1.1` | → `192.168.1.1:80` |
-| `192.168.1.1:8080` | → `192.168.1.1:8080` |
-| `2001:db8::1`（裸 IPv6） | → `[2001:db8::1]:80` |
-| `[2001:db8::1]:8080` | → `[2001:db8::1]:8080` |
-
-**httpcheck**  
-使用标准库 `net/http`，原生支持 IPv6。IPv6 字面地址在 URL 中须遵循 RFC 3986 括号格式：
-
-```
-http://[2001:db8::1]/path        ✅
-https://[2001:db8::1]:8443/api   ✅
-http://2001:db8::1/path          ❌ 不合法，stdlib 解析失败
-```
-
-**dnscheck**  
-`net.Resolver.LookupIP` 查询目标域名：`auto` 下同时返回 A+AAAA 记录（等价旧版 `LookupIPAddr` 行为）；`v4`/`v6` 限定为只查 A / 只查 AAAA；`both` 时 A、AAAA 各出一条结果——可用于单独监控某一族解析是否损坏。结果中的第一个地址记入 `detail` 字段。DNS 查询通过绑定了 `source_ip` 的 UDP socket 发出，支持 IPv4 和 IPv6 上游 DNS 服务器。
-
-**traceroute**  
-代码内部按目标地址族分叉：IPv4 目标走 `ip4:icmp`（ICMPv4 Echo + TTL），IPv6 目标走 `ip6:ipv6-icmp`（ICMPv6 EchoRequest + HopLimit）。Source IP 通过 `icmp.ListenPacket(network, sourceIP)` 绑定，对两个地址族均有效。
-
-**mtr**  
-`mtr` 二进制本身支持双栈，目标为 IPv6 地址时自动使用 ICMPv6。`--address` 参数接受 IPv4 或 IPv6 源地址。
-
-## 安全设计
-
-- **双向 mTLS**：任务拉取、结果上传、证书续签均走 mTLS 通道。服务端 CA 签发 Agent 证书，Agent 信任服务端 CA；双方互相验证，任意一方证书失效即连接拒绝。
-- **`X-Agent-Version` 请求头**：所有 mTLS 请求都注入该头（值为编译时 `-ldflags` 写入的版本号），供服务端记录 Agent 软件版本，无需额外鉴权字段。
-- **证书文件权限**：私钥 `client.key` 写入权限为 `0600`；`certs.dir` 目录权限为 `0700`。
-- **insecure_enroll 仅限首次**：`insecure_enroll: true` 只影响 enroll 端点（端口 8443）的 TLS 验证，mTLS 同步通道（端口 8444）始终执行完整证书验证，不受该选项影响。
-- **provisioning_token 一次性**：Enroll 成功后该 token 即失效；配置中可将其清空或删除，后续所有连接凭证书鉴权。
-
-## 构建与发布
-
-[`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `v*` Tag 时自动执行：
-
-1. **verify**：`go mod tidy && go vet ./... && go test ./...`，只跑一次（不重复跑 6 遍）。
-2. **build**：矩阵交叉编译 `{linux, windows, darwin} × {amd64, arm64}` 共 6 个目标，均基于 `CGO_ENABLED=0` 纯 Go 静态编译，全部在单个 `ubuntu-latest` runner 上完成。通过 `-ldflags` 写入 `version`/`commit`/`buildDate`，可用 `-version` 查看。每个目标打包成含二进制 + `configs/config.yaml` + `README.md` 的压缩包。
-3. **release**：汇总产物，生成 `SHA256SUMS.txt`，按 Tag 间 commit 自动生成 Changelog，调用 `softprops/action-gh-release` 发布。
-
-`workflow_dispatch` 可手动触发完整编译矩阵做预验证，不会创建 Release。
-
-发布新版本：
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-本地交叉编译示例（Linux arm64）：
-
-```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-  go build -trimpath -ldflags "-s -w -X main.version=1.0.0" -o nms-agent_linux_arm64 .
-```
-
-## 配置 systemd 服务常驻
-
-以下步骤适用于 Linux（systemd），使 NMS Agent 开机自启并在崩溃后自动重启。提供两种部署布局：**自包含目录**（简单，以 root 运行）和**专用账户**（生产推荐）。
+`Ctrl+C`（或 `kill -TERM <pid>`）触发优雅停机；SIGHUP 被忽略（SSH 断连不影响运行）。
 
 ---
 
-### 方式一：自包含目录（root）
+## 3. 配置说明
 
-所有文件放在同一个目录下，适合快速部署或单机场景。
+完整示例见 [`configs/config.yaml`](configs/config.yaml)。所有 duration 字段接受 Go 格式（`30s`、`1m`）。
+
+### 3.1 agent 块 — 身份
+
+```yaml
+agent:
+  id: ""                  # 留空；enroll 后从 .certs/agent_id 读取
+  region: "HKG"           # 区域标识（当前仅用于本地日志）
+  tags:                   # 自定义标签（当前仅本地保留，暂未随协议上报）
+    role: "edge"
+  hostname_override: ""   # 留空时 enroll 用 os.Hostname()
+```
+
+### 3.2 server 块 — 服务端与同步节奏
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `enroll_url` | — | 单向 TLS 注册端点，仅首次 enroll 使用 |
+| `report_url` | —（必填） | mTLS 同步端点：任务拉取 / 结果上传 / 续签 / OTA |
+| `provisioning_token` | — | 一次性注册 token，enroll 成功后即可清空 |
+| `insecure_enroll` | `false` | 仅放宽 enroll 端点的 TLS 验证（自签场景）；mTLS 通道不受影响 |
+| `task_poll_interval` | `30s` | 拉取任务清单的间隔 |
+| `flush_interval` | `30s` | 结果上传的最大等待时间 |
+| `batch_size` | `100` | 攒够即刻上传（不等 flush_interval） |
+| `request_timeout` | `30s` | 单次 HTTP 请求超时 |
+
+### 3.3 runtime 块 — 日志与运行时
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `log.file` | `logs/nms-agent.log` | 留空输出 stderr；systemd 场景建议绝对路径 |
+| `log.level` | `info` | 日志级别：`debug` / `info` / `warn` / `error`（排障时开 debug 可看到调度调和、上传明细） |
+| `log.max_size_mb` | `100` | 按大小轮转（lumberjack） |
+| `log.max_age_days` | `30` | 轮转文件保留天数 |
+| `log.max_backups` | `30` | 轮转文件保留个数 |
+| `log.compress` | `true` | gzip 压缩旧日志 |
+| `grace_period` | `30s` | 收到停机信号后等待在途工作的上限 |
+| `max_concurrency` | `20` | 并发探测任务上限（信号量） |
+
+### 3.4 certs 块 — 证书目录
+
+```yaml
+certs:
+  dir: ".certs"   # 存放 ca.crt / client.crt / client.key / agent_id
+```
+
+### 3.5 敏感信息与环境变量
+
+配置文件在加载前整体做 `${ENV_VAR}` 展开，`provisioning_token: "${NMS_TOKEN}"` 即可从环境变量注入，配置文件本身可安全入库。推荐 systemd `EnvironmentFile=` 或容器 Secret 注入。
+
+---
+
+## 4. 功能模块
+
+> 本章按「一个菜单一个功能」组织：每个小节对应一个独立模块 / 一种探测类型，可直接跳转查阅。
+
+### 4.1 证书与身份 — internal/cert
+
+```
+首次启动
+  └─ .certs/ 缺任一文件
+       └─ POST /api/v1/agents/enroll（单向 HTTPS + provisioning_token + hostname）
+            └─ 落盘 ca.crt / client.crt / client.key(0600) / agent_id（目录 0700）
+
+后续启动
+  └─ 读取 agent_id → 直接初始化 mTLS 客户端
+
+运行中自动续签
+  ├─ 后台协程每 24h 检查 client.crt 的 NotAfter
+  ├─ 剩余 < 30 天 → POST /agent-sync/renew-cert（mTLS）
+  │    └─ 先校验新 cert/key 配对，再经「临时文件 + rename」原子落盘（CA 有则一并更新）
+  └─ mTLS 客户端的 DialTLSContext 在每次新建 TLS 连接时从磁盘重读 CA + 客户端证书
+       └─ 续签 / CA 轮换零重启生效
+```
+
+关键设计：**不缓存 TLS 配置**。`NewMTLSClient` 不用静态 `tls.Config`，而是自定义 `DialTLSContext` 每次拨号读盘 —— 这是 CA 轮换不掉线的关键（也是 OTA 期间握手不 EOF 的修复点）。启动时会先做一次证书解析校验，让配置错误立刻暴露。
+
+另有 `NewMTLSClientForFamily(dir, timeout, "tcp4"|"tcp6")` 变体，强制单一地址族拨号，供公网 IP 自发现使用（见 [4.7](#47-公网-ip-自发现--maingo)）。
+
+### 4.2 任务调度 — internal/scheduler
+
+- **拉取**：启动立即拉一次，之后每 `task_poll_interval` 拉取 `GET /agent-sync/tasks`，响应含任务数组、`source_ipv4/ipv6`、可选 `update` OTA 指令。
+- **diff 式调和**：维护 `map[taskID]*taskRunner`。服务端移除的任务 → cancel 协程；新增任务 → 启动协程；参数变化（interval / type / targets / address_family / skip_tls_verify / SNMP 参数块）→ 先 cancel 再重建。未变化的任务不受影响。
+- **源 IP 变更**：任一族源 IP 变化 → 取消全部 runner，同一轮调和内以新绑定重建。
+- **并发控制**：全局共享一个 `max_concurrency` 容量的限流器，按**单个探测执行**（每个 target × 地址族）占坑，而非按任务 tick —— 多目标任务也不会突破并发上限。
+- **执行节奏**：每个任务独立 ticker（`interval_seconds`，≤0 时回退 60s），启动后立即执行首轮。执行是同步的 —— 单轮超时不会造成同一任务自身重叠执行。
+- **SNMP 错峰**：`snmp_poll` 任务按 `task_id % interval` 加确定性启动偏移，避免同机房设备被同秒齐射（所有 runner 共享同一个调和时刻，不加偏移会永久锁相）。
+- **OTA 透传**：响应携带 `update` 时经容量 1 的 channel 通知 main（重复指令去重），由 main 执行优雅停机 + 升级（见 [4.5](#45-ota-自动升级--internalupdater)）。
+
+### 4.3 探测引擎 — internal/probe
+
+`Dispatch()` 按 `type` 路由。所有探测类型由服务端指定，本地不声明。通用规则：
+
+- **target 形态**：字面 IPv4/IPv6 地址或域名；tcpping/httpcheck 可带 `:port`；httpcheck 亦可为完整 `http(s)://` URL。
+- **address_family**（任务级，只作用于**域名** target）：缺省/`auto` 跟随系统解析偏好；`v4`/`v6` 限定单族；`both` 每域名双族各测一次，结果 target 加 ` (v4)` / ` (v6)` 后缀成两条独立序列（该后缀是与 NMS 前端的跨仓库契约，勿单方面改动）。字面 IP 永远按自身族探测一次。
+- **源 IP 选择**：按解析后的目标地址族取对应的 `source_ipv4` / `source_ipv6`；该族未配置源地址时不绑定、走系统默认路由（见 [5.1](#51-source-ip-绑定)）。
+
+#### 4.3.1 ping / meshping
+
+`pro-bing` 库 ICMP echo，count 3 / 间隔 1s / 超时 5s，取平均 RTT。`SetPrivileged(true)` 走原始套接字（Linux 需 root 或 `CAP_NET_RAW`，Windows 需管理员）。域名族限定用 `SetNetwork("ip4"/"ip6")`；`Resolve()` 后按实际地址族选源 IP（`pinger.Source`）。全部丢包按失败上报 `100% packet loss`。
+
+#### 4.3.2 tcpping
+
+TCP 三次握手可达性 + 建连耗时。目标格式解析：
+
+| 输入 | 实际拨号 |
+|------|---------|
+| `192.168.1.1` | `192.168.1.1:80`（无端口默认 80） |
+| `192.168.1.1:8080` | `192.168.1.1:8080` |
+| `2001:db8::1`（裸 IPv6） | `[2001:db8::1]:80` |
+| `[2001:db8::1]:8080` | `[2001:db8::1]:8080` |
+
+域名先按任务族显式 `LookupIP` 解析成字面 IP 再拨号（取第一条记录）—— 保证实际拨号族与源 IP 绑定选择永远一致。源绑定：`net.Dialer{LocalAddr: &net.TCPAddr{...}}`，拨号超时 5s。
+
+#### 4.3.3 httpcheck
+
+标准库 `net/http` 发 GET，2xx/3xx 记成功，记录整体耗时。要点：
+
+- **scheme 推断**：无 `http(s)://` 前缀的 `host:443` / `host:8443` 默认按 https 探测（避免向 TLS 端口发明文得到误导性 EOF）；其余默认 http。需要非常规组合时显式写全 URL。
+- **skip_tls_verify**（任务级）：跳过证书校验，用于裸 IP / 自签设备。
+- **族强制**：URL 保留域名（Host 头 / TLS SNI 不变），在 `DialContext` 层用 `tcp4`/`tcp6` 强制拨号族。
+- IPv6 字面地址必须用 RFC 3986 括号格式：`https://[2001:db8::1]:8443/api`。
+
+#### 4.3.4 dnscheck
+
+`net.Resolver`（PreferGo）对目标域名做解析探测：`auto` = A+AAAA 合并；`v4`/`v6` = 只查 A / 只查 AAAA；`both` = A、AAAA 各出一条结果（可单独监控某族解析是否损坏）。第一个解析结果写入 `detail`。UDP socket 按上游 DNS 服务器地址族绑定源 IP，单次拨号超时 5s。
+
+#### 4.3.5 traceroute
+
+自实现逐跳追踪：原始 ICMP 套接字（IPv4 走 `ip4:icmp` + TTL，IPv6 走 `ip6:ipv6-icmp` + HopLimit），最多 30 跳、每跳等待 3s，`detail` 输出 JSON hop 数组（ttl/ip/rtt_ms/timeout）及 `reached` 标记。回包按 Echo ID + 序号精确匹配（TimeExceeded 解析内嵌的原始报文校验），每次追踪使用独立 ID —— 多个 traceroute 任务并发时不会互认对方的回包。需要 root / `CAP_NET_RAW`；**Windows 下返回说明性错误结果，不执行**。同一任务内的多个 target 串行执行 —— 并发原始套接字会互抢 ICMP 回包导致跳数归属错乱。
+
+#### 4.3.6 mtr / meshmtr
+
+调用系统 `mtr` 二进制（`--report --json --no-dns`，10 循环、30 跳上限），解析 JSON 输出为 hop 数组（loss/avg/best/worst/stddev）写入 `detail`。族限定传 `-4`/`-6`，源绑定传 `--address`。要求节点已安装 `mtr` 或 `mtr-tiny`；**Windows 下返回说明性错误结果**。
+
+#### 4.3.7 snmp_poll — SNMP 探针代理
+
+与其余类型不同：任务由服务端从设备表**逐台合成**（一台设备一条任务，虚拟 TaskID），`snmp` 参数块携带全部采集要素，Agent 本地零配置：
+
+| 参数 | 说明 |
+|------|------|
+| `version` | `1` / `2c` / `3` |
+| `community` | v1/v2c 团体名 |
+| `v3_user` + `v3_auth_proto/pass` + `v3_priv_proto/pass` | v3 USM：认证 MD5/SHA/SHA224/SHA256/SHA384/SHA512，加密 DES/AES/AES192/AES256/AES192C/AES256C；按填写程度自动升级 NoAuthNoPriv → AuthNoPriv → AuthPriv |
+| `port` / `timeout_seconds` / `retries` | 连接参数（默认 161 / 3s / 保底非负） |
+| `inventory_every_n` | 快慢节奏：每 N 次采一次完整 system 组 |
+| `extra_oids` | 自定义标量 OID 列表，每次 poll 随行 |
+| `collect_interfaces` | 每周期 WALK `ifTable` + `ifXTable`（v2c/v3 GETBULK、v1 GETNEXT），上限 512 接口 |
+
+**采集节奏**：每周期只采 `sysUpTime`（最小报文，兼做存活判定）+ 自定义 OID；每 `inventory_every_n` 次附带完整 system 组（sysName/sysDescr/sysObjectID/sysLocation/sysContact）—— 资产信息变化少，无需每轮取。
+
+**接口表**：上报原始计数器（HC 64 位优先，缺 ifXTable 回退 32 位），由服务端按 `collected_at` 换算速率；WALK 失败不影响本次采集结论（`has_interfaces` 区分「walk 成功零行」与「walk 未执行」）。
+
+**错误分类**：结果携带 `error_kind`（`unreachable` / `snmp_timeout` / `snmp_error` / `auth_fail`）。v3 USM 认证失败显式归 `auth_fail`；`notInTimeWindow` 是 v3 时间窗重同步信号（gosnmp 自动重试），残留场景归 `snmp_error` 而非误报凭证问题；v1/v2c 下错误团体名表现为超时（协议限制）。
+
+**安全**：凭证只存在于内存任务快照 —— 每个同步周期从服务端全量重建，从不落盘、不打日志。
+
+### 4.4 结果上报 — internal/reporter
+
+- **双队列**：普通探测结果与 SNMP 结论各一条内存队列（容量 `max(batch_size×10, 1000)`），分别攒批 POST 到 `/agent-sync/results` 与 `/agent-sync/snmp-results` —— SNMP 结论是状态快照（驱动服务端设备状态机），不能混入时序 ingest 通道。
+- **触发条件**：任一 buffer 达到 `batch_size`，或 `flush_interval` 到期。
+- **失败重试**：上传失败（网络错误 / 5xx / 429）的批次保留在缓冲中，指数退避重试（5s 起、翻倍、上限 2min）；4xx 视为服务端明确拒绝、直接丢弃避免卡死缓冲。缓冲上限 `max(batch_size×10, 1000)`，超限淘汰最旧数据（断连期间保新弃旧）。
+- **背压策略**：入口队列满时丢弃新结果并告警日志 —— 宁丢单点数据也不阻塞探测协程（SNMP 结论天然可丢：下轮 poll 覆盖）。
+- **时间基准**：每条探测结果携带 `collected_at`（unix 秒，探测完成时刻）—— 攒批最多延迟 `flush_interval` 上传，服务端应以该字段而非入库时间作为样本时间戳。
+- **优雅停机**：ctx 取消后先排空两条队列、无视退避窗口做最后一次 flush 再退出。
+
+### 4.5 OTA 自动升级 — internal/updater
+
+```
+服务端任务响应携带 update{version, binary_id, sha256, file_size}
+  └─ Scheduler 经 channel 通知 main
+       └─ 优雅停机（等 Reporter 排空 + 探测协程退出，上限 grace_period）
+            └─ mTLS 下载 /agent-sync/binary/{id}（10 分钟超时，按 file_size 预分配）
+                 └─ SHA-256 校验 → chmod 755 → os.Rename 原子替换自身二进制
+                      ├─ Linux/macOS：syscall.Exec 原地换像（PID 不变，systemd 无感知）
+                      └─ Windows：os.Exit(0)，交由服务管理器重启
+```
+
+关键约束：**临时文件必须写在可执行文件同目录**（`os.Rename` 只在同一文件系统内原子）。systemd `ProtectSystem=strict` 场景必须把**安装目录本身**列入 `ReadWritePaths`，且二进制属主为服务账户，否则更新陷入失败循环（见 [6.5](#65-故障排查)）。下载失败 / 校验失败时退出交由服务管理器重启，下个同步周期自动重试。
+
+### 4.6 结构化日志 — internal/logger
+
+slog JSON 格式；`log.file` 配置后由 lumberjack 托管轮转（大小 / 天数 / 份数 / gzip），另有独立协程在每日本地时间零点强制切割一次 —— 即使没写满 `max_size_mb` 也按天分文件。留空 `log.file` 输出 stderr（容器 / journald 场景）。
+
+### 4.7 公网 IP 自发现 — main.go
+
+启动时及之后每 24h，分别用强制 `tcp4` / `tcp6` 的 mTLS 客户端请求服务端 `GET /agent-sync/my-ip` 反射端点，取服务端视角的公网双栈地址 —— 正确处理云 NAT（GCP/AWS 内网卡地址 ≠ 公网地址）。发现结果注入后续所有 mTLS 请求的 `X-Agent-IPv4` / `X-Agent-IPv6` 头；某族探测失败不清空已缓存地址。
+
+---
+
+## 5. 高级主题
+
+### 5.1 Source IP 绑定
+
+服务端在任务响应中按族下发 `source_ipv4` / `source_ipv6`（可为空）。各协议绑定方式：
+
+| 协议 | 绑定实现 |
+|------|---------|
+| ICMP（ping） | `pinger.Source = src` |
+| TCP（tcpping / httpcheck） | `net.Dialer{LocalAddr: &net.TCPAddr{IP: ...}}` |
+| DNS（dnscheck） | `net.Resolver{Dial: ...}` 内 `net.Dialer{LocalAddr: &net.UDPAddr{...}}` |
+| 原始 ICMP（traceroute） | `icmp.ListenPacket(network, src)` |
+| mtr | `mtr --address src` |
+
+规则：
+
+- 源 IP 按**解析后目标的地址族**选取，不会出现 v4 源绑 v6 目标的非法组合。
+- 某族未配置源地址 → 该族探测不绑定、走系统默认路由，**不会因缺配而失败**。
+- 任一族源 IP 变更（含有值 ↔ 空）→ 所有探测协程当轮重启，立即以新地址重建 socket。
+- Agent 本身缺某族出网能力（如无 IPv6 链路）时，`address_family=both` 下该族探测持续失败 —— 这是可见的诊断信号，属预期行为。
+
+### 5.2 双栈 IPv4/IPv6 与 address_family
+
+所有探测原生双栈，无全局开关；域名解析族由任务级 `address_family` 控制。各协议强制族的机制：
+
+| 探测 | 族强制方式 |
+|------|-----------|
+| ping | pro-bing `SetNetwork("ip4"/"ip6")` |
+| tcpping / traceroute | 先按族 `LookupIP` 解析成字面 IP 再探测 |
+| httpcheck | URL 保留域名（Host / SNI 不变），拨号层 `tcp4`/`tcp6` |
+| dnscheck | 族映射为只查 A / 只查 AAAA |
+| mtr | 透传 `-4` / `-6` |
+
+`both` 模式下每域名产出两条结果序列（target 后缀 ` (v4)` / ` (v6)`），可分别观测两族链路质量。
+
+### 5.3 安全设计
+
+- **双向 mTLS**：任务拉取、结果上传、续签、OTA 下载全部走 mTLS；任一方证书失效即拒连。
+- **最小化本地机密**：私钥 `0600`、证书目录 `0700`；SNMP 凭证仅内存持有，不落盘不打日志。
+- **`insecure_enroll` 影响面受限**：只放宽 enroll 端点（首次注册）的验证，mTLS 同步通道始终完整校验。
+- **provisioning token 一次性**：enroll 成功即失效，配置中可删除；后续鉴权全凭证书。
+- **OTA 完整性**：新二进制经 mTLS 通道下载 + SHA-256 校验后才替换。
+- **请求头指纹**：所有 mTLS 请求注入 `X-Agent-Version / X-Agent-OS / X-Agent-Arch / X-Agent-IPv4 / X-Agent-IPv6`，供服务端做版本管理与地址展示。
+
+---
+
+## 6. 部署运维
+
+### 6.1 systemd 方式一：自包含目录（root）
+
+所有文件同目录，适合快速部署 / 单机场景。
 
 **目录布局**
 
 ```
 /opt/nms-agent/
 ├── nms-agent            # 二进制
-├── configs/
-│   └── config.yaml
+├── configs/config.yaml
 ├── env                  # 敏感变量（chmod 600）
-├── .certs/              # enrollment 后自动生成
-└── logs/                # 日志文件
+├── .certs/              # enroll 后自动生成
+└── logs/
 ```
 
-**config.yaml 使用相对路径即可**（`WorkingDirectory` 会将工作目录固定为 `/opt/nms-agent`）：
+`config.yaml` 用相对路径即可（`WorkingDirectory` 固定工作目录）。
 
-```yaml
-runtime:
-  log:
-    file: "logs/nms-agent.log"
-
-certs:
-  dir: ".certs"
-```
-
-**注入 provisioning token**
+**注入 token**
 
 ```bash
 cat > /opt/nms-agent/env <<'EOF'
@@ -385,57 +485,41 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-# WorkingDirectory 是关键：config.yaml 中的相对路径（logs/、.certs/）
-# 均以此目录为基准解析，不设则默认为 /，路径全部错误。
+# 关键：config.yaml 中的相对路径（logs/、.certs/）以此为基准
 WorkingDirectory=/opt/nms-agent
 ExecStart=/opt/nms-agent/nms-agent -config /opt/nms-agent/configs/config.yaml
 Restart=on-failure
 RestartSec=10s
-# 略长于 grace_period（30s），确保 Agent 完成优雅停机后 systemd 再发 SIGKILL
+# 略长于 grace_period（30s），保证优雅停机走完再 SIGKILL
 TimeoutStopSec=35s
 
-# 从独立文件注入敏感变量；前置 - 表示文件不存在时不报错
 EnvironmentFile=-/opt/nms-agent/env
 
-# 安全加固（root 运行时无需 AmbientCapabilities）
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# ProtectSystem=strict 将文件系统设为只读；运行时需要写入的目录必须在此列出。
-# ⚠️ 必须包含安装目录本身（而不仅是 logs/.certs 子目录）：OTA 自更新要在可执行
-# 文件旁写入临时二进制再原子替换（rename 只在同一文件系统内原子），目录只读会让
-# 更新陷入失败重启循环，日志表现为 "create temp file: ... read-only file system"
+# ⚠️ 必须包含安装目录本身（而不仅是 logs/.certs 子目录）：
+# OTA 要在可执行文件旁写临时二进制做原子替换，目录只读会陷入更新失败循环
 ReadWritePaths=/opt/nms-agent
 
 [Install]
 WantedBy=multi-user.target
 EOF
-```
 
-```bash
 systemctl daemon-reload
 systemctl enable --now nms-agent
 ```
 
----
+### 6.2 systemd 方式二：专用账户（生产推荐）
 
-### 方式二：专用账户（生产推荐）
-
-独立账户 + FHS 标准路径，配合最小权限原则。
-
-**创建系统账户**
+独立账户 + FHS 路径 + 最小权限。
 
 ```bash
 useradd -r -s /sbin/nologin -d /var/lib/nms-agent -m nms-agent
-```
 
-**安装文件**
-
-```bash
-# 二进制放在服务账户可写的目录：OTA 自更新要求进程能替换自身二进制
-# （非 root 账户替换不了 /usr/local/bin 下 root 属主的文件）。
-# 若安全策略要求二进制目录只读，请装回 /usr/local/bin 并放弃 OTA、改用外部方式分发更新。
+# 二进制放服务账户可写目录：OTA 要求进程能替换自身二进制。
+# 若安全策略要求二进制目录只读，装回 /usr/local/bin 并放弃 OTA、改用外部分发。
 mkdir -p /var/lib/nms-agent/bin
 install -o nms-agent -g nms-agent -m 755 nms-agent /var/lib/nms-agent/bin/nms-agent
 
@@ -444,27 +528,21 @@ install -o root -g nms-agent -m 640 configs/config.yaml /etc/nms-agent/config.ya
 
 mkdir -p /var/log/nms-agent && chown nms-agent:nms-agent /var/log/nms-agent
 mkdir -p /var/lib/nms-agent/.certs && chown -R nms-agent:nms-agent /var/lib/nms-agent
-```
 
-**注入 provisioning token**
-
-```bash
 tee /etc/nms-agent/env > /dev/null <<'EOF'
 NMS_TOKEN=your-one-time-provisioning-token
 EOF
 chmod 600 /etc/nms-agent/env
 ```
 
-**config.yaml 使用绝对路径**
+`config.yaml` 改绝对路径：
 
 ```yaml
 server:
   provisioning_token: "${NMS_TOKEN}"
-
 runtime:
   log:
     file: "/var/log/nms-agent/nms-agent.log"
-
 certs:
   dir: "/var/lib/nms-agent/.certs"
 ```
@@ -490,7 +568,7 @@ TimeoutStopSec=35s
 
 EnvironmentFile=-/etc/nms-agent/env
 
-# 非 root 账户需要 CAP_NET_RAW 才能使用 ping / traceroute 的原始套接字
+# 非 root 需要 CAP_NET_RAW 才能用 ping / traceroute 的原始套接字
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
 
@@ -498,54 +576,114 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# /var/lib/nms-agent 同时覆盖 .certs 与 bin/（OTA 自更新在 bin/ 写临时二进制做原子替换）
+# /var/lib/nms-agent 同时覆盖 .certs 与 bin/（OTA 在 bin/ 写临时二进制原子替换）
 ReadWritePaths=/var/log/nms-agent /var/lib/nms-agent
 
 [Install]
 WantedBy=multi-user.target
 EOF
-```
 
-```bash
 systemctl daemon-reload
 systemctl enable --now nms-agent
 ```
 
----
+### 6.3 Windows 部署注意事项
 
-### 常用管理命令
+- Agent 不含 Windows 服务集成，需借助 **NSSM / WinSW / 任务计划程序** 常驻，并配置「退出后自动重启」（OTA 完成时 Agent 以退出码 0 结束，依赖外部管理器拉起新二进制）。
+- ICMP ping 需要管理员权限（原始套接字）或放行防火墙。
+- traceroute / mtr 任务在 Windows 上返回说明性错误结果并上报，不影响其他探测。
+
+### 6.4 常用管理命令
 
 ```bash
 systemctl status nms-agent          # 运行状态
-systemctl restart nms-agent         # 重启（修改配置后执行）
+systemctl restart nms-agent         # 重启（改配置后执行）
 systemctl stop nms-agent            # 停止
 
-journalctl -u nms-agent -f          # 实时跟踪 journald 日志
-tail -f /opt/nms-agent/logs/nms-agent.log   # 或直接查看滚动日志文件
+journalctl -u nms-agent -f          # 实时 journald 日志
+tail -f /opt/nms-agent/logs/nms-agent.log   # 或直接看滚动日志文件
 ```
 
-### 常见启动失败原因
+### 6.5 故障排查
 
 | 现象 | 原因 | 解决 |
 |------|------|------|
-| `status=1/FAILURE`，日志提示权限错误 | `ProtectSystem=strict` 开启但 `ReadWritePaths` 未配置，Agent 无法写日志或证书 | 在 unit 文件中正确填写 `ReadWritePaths`，列出所有需要写入的目录 |
-| OTA 更新反复失败重启，日志报 `create temp file: ... read-only file system` | 安装目录不可写：OTA 需在可执行文件旁写临时二进制做原子替换，但 `ReadWritePaths` 只放行了 logs/.certs 子目录（或二进制属主不是服务账户） | `systemctl edit nms-agent`，drop-in 中追加 `[Service]` + `ReadWritePaths=<安装目录>`（列表型配置自动与原有合并），保存后 `systemctl restart nms-agent`，下个同步周期自动完成更新 |
-| 证书/日志路径不存在 | 未设 `WorkingDirectory`，config.yaml 中的相对路径被解析到 `/` 下 | 添加 `WorkingDirectory=<安装目录>` 或在 config.yaml 中改用绝对路径 |
-| enrollment 报 `x509: certificate signed by unknown authority` | enroll 端点使用了系统不信任的证书（自签名或私有 CA） | 在 config.yaml 中设置 `insecure_enroll: true`，enrollment 成功后可改回 `false` |
+| `status=1/FAILURE`，日志报权限错误 | `ProtectSystem=strict` 开启但 `ReadWritePaths` 缺目录 | unit 中列全所有需写入的目录 |
+| OTA 反复失败重启，日志报 `create temp file: ... read-only file system` | 安装目录不可写（`ReadWritePaths` 只放行了 logs/.certs，或二进制属主不对） | `systemctl edit nms-agent` 追加 `[Service]` + `ReadWritePaths=<安装目录>`，restart 后下个同步周期自动完成更新 |
+| 证书 / 日志路径不存在 | 未设 `WorkingDirectory`，相对路径解析到 `/` | 加 `WorkingDirectory` 或改绝对路径 |
+| enroll 报 `x509: certificate signed by unknown authority` | enroll 端点用了系统不信任的证书 | 临时设 `insecure_enroll: true`，enroll 成功后改回 |
+| 日志 `no certificates found and server.provisioning_token is empty` | 证书目录缺文件且无 token 可注册 | 补发 token 重新 enroll，或恢复完整 `.certs/` |
 
-> **提示**：首次 enrollment 成功后（日志出现 `enrollment successful`），可将 `env` 文件中的 `NMS_TOKEN` 行删除——之后凭 mTLS 证书鉴权，provisioning token 不再使用。
+> **提示**：首次 enroll 成功（日志出现 `enrollment successful`）后，可删除 env 文件中的 `NMS_TOKEN` —— 之后全凭 mTLS 证书鉴权。
 
-## 平台限制
+---
+
+## 7. 构建与发布（CI）
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `v*` Tag 时自动执行三阶段：
+
+1. **verify**：`go mod tidy && go vet ./... && go test ./...`（只跑一次，不进矩阵重复跑）。
+2. **build**：矩阵交叉编译 `{linux, windows, darwin} × {amd64, arm64}` 共 6 目标，全部 `CGO_ENABLED=0` 静态编译于单个 ubuntu runner；`-ldflags` 注入 `version / commit / buildDate`（`-version` 可查）；每目标打包为「二进制 + configs/config.yaml + README.md」压缩包。
+3. **release**：汇总产物生成 `SHA256SUMS.txt`，按上一 Tag 起的 commit 自动生成 Changelog，`softprops/action-gh-release` 发布。
+
+`workflow_dispatch` 可手动跑完整编译矩阵做预验证，不产生 Release。
+
+发布新版本：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+本地交叉编译示例（Linux arm64）：
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -trimpath -ldflags "-s -w -X main.version=1.0.0" -o nms-agent_linux_arm64 .
+```
+
+---
+
+## 8. 平台支持矩阵
 
 | 功能 | Linux | macOS | Windows |
 |------|:-----:|:-----:|:-------:|
-| ping / tcpping / httpcheck / dnscheck | ✅ | ✅ | ✅ |
-| traceroute | ✅（需 root 或 `CAP_NET_RAW`） | ✅（需 sudo） | ❌ 返回明确错误 |
-| mtr | ✅（需安装 `mtr-tiny`） | ✅（需安装 `mtr`） | ❌ 返回明确错误 |
-| 日志文件轮转 | ✅ | ✅ | ✅ |
+| ping（ICMP） | ✅ 需 root / `CAP_NET_RAW` | ✅ 需 sudo | ✅ 需管理员 |
+| tcpping / httpcheck / dnscheck | ✅ | ✅ | ✅ |
+| traceroute | ✅ 需 root / `CAP_NET_RAW` | ✅ 需 sudo | ❌ 返回说明性错误 |
+| mtr | ✅ 需安装 `mtr`/`mtr-tiny` | ✅ 需安装 `mtr` | ❌ 返回说明性错误 |
+| snmp_poll | ✅ | ✅ | ✅ |
+| OTA 自升级 | ✅ `syscall.Exec` 原地换像 | ✅ 同左 | ⚠️ 退出后依赖服务管理器拉起 |
+| 日志轮转 | ✅ | ✅ | ✅ |
 
-traceroute 和 mtr 在 Windows 上不可用时，Agent 不会崩溃——对应任务会返回说明性错误结果并上报给服务端，其他探测任务继续正常运行。
+traceroute / mtr 在 Windows 上不可用时 Agent 不会崩溃 —— 对应任务返回说明性错误结果并上报，其余探测正常运行。
 
-## License
+---
 
-本项目尚未指定开源许可证。当前仅限 CION 内部使用；如需对外开源，请补充 `LICENSE` 文件。
+## 9. 服务端 API 契约
+
+Agent 消费的全部服务端接口（`{enroll}` = `enroll_url`，`{sync}` = `report_url`）：
+
+| 方法 | 路径 | 通道 | 用途 |
+|------|------|------|------|
+| POST | `{enroll}/api/v1/agents/enroll` | 单向 TLS | 首次注册：token + hostname → 证书四件套 + agent_id |
+| GET | `{sync}/api/v1/agent-sync/tasks` | mTLS | 拉取任务清单 + source_ipv4/ipv6 + OTA update 指令 |
+| POST | `{sync}/api/v1/agent-sync/results` | mTLS | 批量上传探测结果 |
+| POST | `{sync}/api/v1/agent-sync/snmp-results` | mTLS | 批量上传 SNMP 采集结论 |
+| POST | `{sync}/api/v1/agent-sync/renew-cert` | mTLS | 证书续签 |
+| GET | `{sync}/api/v1/agent-sync/my-ip` | mTLS | 公网 IP 反射（tcp4/tcp6 各查一次） |
+| GET | `{sync}/api/v1/agent-sync/binary/{id}` | mTLS | 下载 OTA 新二进制 |
+
+**任务对象**（`tasks` 数组元素）：`task_id`、`type`、`interval_seconds`、`targets[]`、`address_family`（可选）、`skip_tls_verify`（httpcheck 专用）、`snmp{...}`（snmp_poll 专用）。
+
+**探测结果**：`task_id`、`type`、`target`、`success`、`latency_ms`、`detail`（traceroute/mtr 的 detail 为 hop 数组 JSON）、`collected_at`（unix 秒，探测完成时刻 —— 服务端应以此为样本时间戳，而非入库时间）。
+
+**SNMP 结论**：`device_id`、`collected_at`（unix 秒，服务端速率换算的时间基准）、`success`、`error_kind`、`latency_ms`、`uptime_ticks`、`has_inventory` + system 组字段、`values[]`（自定义 OID）、`has_interfaces` + `interfaces[]`（原始计数器）。
+
+**每请求注入头**：`X-Agent-Version`、`X-Agent-OS`、`X-Agent-Arch`、`X-Agent-IPv4`、`X-Agent-IPv6`。
+
+---
+
+## 10. License
+
+本项目为 CION 内部专有软件（见 [LICENSE](LICENSE)），仅限 CION 及其关联方内部部署与使用，未经书面授权不得对外分发、公开或再许可。如未来需要对外开源，请先将 LICENSE 替换为相应的开源许可证。

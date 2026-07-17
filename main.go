@@ -149,8 +149,9 @@ func runIPRefresh(ctx context.Context, certDir, reportURL string, vt *versionTra
 }
 
 // runCertRenewal checks the mTLS certificate expiry once per day and renews it
-// automatically when fewer than 30 days remain. Because cert.NewMTLSClient uses
-// GetClientCertificate, the renewed cert is picked up on the next TLS handshake
+// automatically when fewer than 30 days remain. Because cert.NewMTLSClient
+// dials via DialTLSContext (re-reading the cert files from disk on every new
+// TLS connection), the renewed cert is picked up on the next connection
 // without an agent restart.
 func runCertRenewal(ctx context.Context, certDir, syncURL string, client *http.Client, log *slog.Logger) {
 	const (

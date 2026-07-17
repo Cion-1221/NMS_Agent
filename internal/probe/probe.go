@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -66,13 +67,17 @@ type SNMPInterface struct {
 }
 
 // Result is what we POST to /api/v1/agent-sync/results.
+// CollectedAt (unix seconds) is the probe completion instant — uploads are
+// batched and can arrive up to flush_interval late, so the server should use
+// it (not ingest time) as the sample timestamp.
 type Result struct {
-	TaskID    int      `json:"task_id"`
-	Type      string   `json:"type"`
-	Target    string   `json:"target"`
-	Success   bool     `json:"success"`
-	LatencyMs *float64 `json:"latency_ms,omitempty"`
-	Detail    string   `json:"detail,omitempty"`
+	TaskID      int      `json:"task_id"`
+	Type        string   `json:"type"`
+	Target      string   `json:"target"`
+	Success     bool     `json:"success"`
+	LatencyMs   *float64 `json:"latency_ms,omitempty"`
+	Detail      string   `json:"detail,omitempty"`
+	CollectedAt int64    `json:"collected_at"`
 }
 
 // SNMPOIDValue is one custom-OID reading inside an SNMPResult.
@@ -109,26 +114,100 @@ type SNMPResult struct {
 	Interfaces    []SNMPInterface `json:"interfaces,omitempty"`
 }
 
+// Limiter bounds the number of probe executions running concurrently across
+// all tasks. Slots are held per probe job (one target × family expansion),
+// not per task tick — a single task with many targets cannot exceed the
+// configured concurrency.
+type Limiter chan struct{}
+
+// NewLimiter returns a Limiter with n slots.
+func NewLimiter(n int) Limiter { return make(Limiter, n) }
+
+// Acquire blocks until a slot is free or ctx is cancelled; it reports whether
+// the slot was acquired. Callers must Release after a successful Acquire.
+func (l Limiter) Acquire(ctx context.Context) bool {
+	select {
+	case l <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Release frees a slot obtained by Acquire.
+func (l Limiter) Release() { <-l }
+
 // Dispatch routes a task to its probe implementation.
 // sourceIPv4 and sourceIPv6 may each be empty; probes select the correct one
 // per target based on address family. Both empty means the OS picks source.
-func Dispatch(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
+// Every per-target probe execution holds one lim slot for its duration.
+func Dispatch(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string, lim Limiter) []Result {
 	switch task.Type {
 	case "ping", "meshping":
-		return runPing(ctx, task, sourceIPv4, sourceIPv6)
+		return runPing(ctx, task, sourceIPv4, sourceIPv6, lim)
 	case "tcpping":
-		return runTCPPing(ctx, task, sourceIPv4, sourceIPv6)
+		return runTCPPing(ctx, task, sourceIPv4, sourceIPv6, lim)
 	case "httpcheck":
-		return runHTTPCheck(ctx, task, sourceIPv4, sourceIPv6)
+		return runHTTPCheck(ctx, task, sourceIPv4, sourceIPv6, lim)
 	case "dnscheck":
-		return runDNSCheck(ctx, task, sourceIPv4, sourceIPv6)
+		return runDNSCheck(ctx, task, sourceIPv4, sourceIPv6, lim)
 	case "traceroute":
-		return runTraceroute(ctx, task, sourceIPv4, sourceIPv6)
+		return runTraceroute(ctx, task, sourceIPv4, sourceIPv6, lim)
 	case "mtr", "meshmtr":
-		return runMTR(ctx, task, sourceIPv4, sourceIPv6)
+		return runMTR(ctx, task, sourceIPv4, sourceIPv6, lim)
 	default:
 		return nil
 	}
+}
+
+// runJobs expands the task's targets by address family (hostOf extracts the
+// hostname used for the expansion; nil means the target itself), runs fn for
+// each job concurrently under lim, and collects the completed results. Jobs
+// still waiting for a slot when ctx is cancelled produce no result.
+func runJobs(ctx context.Context, task Task, lim Limiter, hostOf func(string) string, fn func(ctx context.Context, target string, fp famProbe) Result) []Result {
+	type job struct {
+		target string
+		fp     famProbe
+	}
+	var jobs []job
+	for _, target := range task.Targets {
+		host := target
+		if hostOf != nil {
+			host = hostOf(target)
+		}
+		for _, fp := range famProbesFor(task.AddressFamily, host) {
+			jobs = append(jobs, job{target, fp})
+		}
+	}
+
+	resCh := make(chan Result, len(jobs))
+	var wg sync.WaitGroup
+	for _, j := range jobs {
+		j := j
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !lim.Acquire(ctx) {
+				return // cancelled while waiting for a slot; nothing to report
+			}
+			defer lim.Release()
+			resCh <- stamp(fn(ctx, j.target, j.fp))
+		}()
+	}
+	wg.Wait()
+	close(resCh)
+
+	results := make([]Result, 0, len(jobs))
+	for r := range resCh {
+		results = append(results, r)
+	}
+	return results
+}
+
+// stamp records the probe completion instant on a result (see Result.CollectedAt).
+func stamp(r Result) Result {
+	r.CollectedAt = time.Now().Unix()
+	return r
 }
 
 // famProbe is one per-family expansion of a raw target. family is the Go

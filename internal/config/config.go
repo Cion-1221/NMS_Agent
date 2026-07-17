@@ -37,6 +37,7 @@ type ServerConfig struct {
 
 type LogConfig struct {
 	File       string `mapstructure:"file"`
+	Level      string `mapstructure:"level"` // debug / info / warn / error
 	MaxSizeMB  int    `mapstructure:"max_size_mb"`
 	MaxAgeDays int    `mapstructure:"max_age_days"`
 	MaxBackups int    `mapstructure:"max_backups"`
@@ -71,6 +72,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("server.request_timeout", "30s")
 	v.SetDefault("runtime.grace_period", "30s")
 	v.SetDefault("runtime.max_concurrency", 20)
+	v.SetDefault("runtime.log.level", "info")
 	v.SetDefault("runtime.log.max_size_mb", 100)
 	v.SetDefault("runtime.log.max_age_days", 30)
 	v.SetDefault("runtime.log.max_backups", 30)

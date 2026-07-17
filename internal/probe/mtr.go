@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"sync"
 )
 
 type mtrHop struct {
@@ -41,30 +40,10 @@ func init() {
 	mtrBinary, _ = exec.LookPath("mtr")
 }
 
-func runMTR(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string) []Result {
-	type job struct {
-		target string
-		fp     famProbe
-	}
-	var jobs []job
-	for _, target := range task.Targets {
-		for _, fp := range famProbesFor(task.AddressFamily, target) {
-			jobs = append(jobs, job{target, fp})
-		}
-	}
-
-	results := make([]Result, len(jobs))
-	var wg sync.WaitGroup
-	for i, j := range jobs {
-		i, j := i, j
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = doMTR(ctx, task.TaskID, task.Type, j.target, j.fp, sourceIPv4, sourceIPv6)
-		}()
-	}
-	wg.Wait()
-	return results
+func runMTR(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string, lim Limiter) []Result {
+	return runJobs(ctx, task, lim, nil, func(ctx context.Context, target string, fp famProbe) Result {
+		return doMTR(ctx, task.TaskID, task.Type, target, fp, sourceIPv4, sourceIPv6)
+	})
 }
 
 func doMTR(ctx context.Context, taskID int, taskType, target string, fp famProbe, sourceIPv4, sourceIPv6 string) Result {

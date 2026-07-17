@@ -10,6 +10,7 @@
 package probe
 
 import (
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -380,9 +381,11 @@ func decodeOIDValue(oid string, v gosnmp.SnmpPDU) SNMPOIDValue {
 			res.Value = strconv.FormatFloat(f, 'f', -1, 64)
 		}
 	default:
-		// Integer / Counter32 / Gauge32 / Counter64 / TimeTicks / Uinteger32
+		// Integer / Counter32 / Gauge32 / Counter64 / TimeTicks / Uinteger32.
+		// Convert via big.Float: Counter64 values above 2^63 would wrap
+		// negative through Int64(). Value keeps the exact decimal string.
 		if n := gosnmp.ToBigInt(v.Value); n != nil {
-			f := float64(n.Int64())
+			f, _ := new(big.Float).SetInt(n).Float64()
 			res.Numeric = &f
 			res.Value = n.String()
 		}

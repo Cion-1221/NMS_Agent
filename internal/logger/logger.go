@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -39,7 +40,7 @@ func New(cfg config.LogConfig) (*slog.Logger, func(context.Context), func()) {
 		w = os.Stderr
 	}
 
-	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo})
+	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: parseLevel(cfg.Level)})
 	log := slog.New(h)
 	slog.SetDefault(log)
 
@@ -57,6 +58,21 @@ func New(cfg config.LogConfig) (*slog.Logger, func(context.Context), func()) {
 	}
 
 	return log, startRotation, closeFunc
+}
+
+// parseLevel maps the runtime.log.level config string to a slog level.
+// Unknown or empty values fall back to Info.
+func parseLevel(s string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // dailyRotate triggers lj.Rotate() at local midnight on each calendar day,

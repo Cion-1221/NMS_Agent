@@ -37,13 +37,13 @@ type taskRunner struct {
 }
 
 // Scheduler fetches tasks via mTLS, keeps them reconciled, and dispatches
-// probes with a shared concurrency semaphore.
+// probes under a shared concurrency limiter.
 type Scheduler struct {
 	client   *http.Client
 	syncURL  string
 	reporter *reporter.Reporter
 	cfg      config.ServerConfig
-	sem      chan struct{}
+	lim      probe.Limiter
 	updateCh chan updater.Update // capacity 1; fires at most once when server requests upgrade
 
 	mu         sync.RWMutex
@@ -60,7 +60,7 @@ func New(client *http.Client, syncURL string, rep *reporter.Reporter, cfg config
 		syncURL:  syncURL,
 		reporter: rep,
 		cfg:      cfg,
-		sem:      make(chan struct{}, maxConcurrency),
+		lim:      probe.NewLimiter(maxConcurrency),
 		updateCh: make(chan updater.Update, 1),
 	}
 }
@@ -291,22 +291,19 @@ func (s *Scheduler) runTask(ctx context.Context, task probe.Task) {
 	}
 }
 
-// execute acquires a slot from the concurrency semaphore, reads the current
-// source IPs, runs the probe, and feeds results to the reporter. seq is the
+// execute reads the current source IPs, runs the probe under the shared
+// concurrency limiter, and feeds results to the reporter. seq is the
 // per-runner tick counter: snmp_poll uses it for the fast/slow cadence (the
 // first tick and every InventoryEveryN-th tick fetch the full system group).
 func (s *Scheduler) execute(ctx context.Context, task probe.Task, seq uint64) {
-	select {
-	case s.sem <- struct{}{}:
-	case <-ctx.Done():
-		return
-	}
-	defer func() { <-s.sem }()
-
 	if task.Type == "snmp_poll" {
 		if task.SNMP == nil {
 			return // malformed payload; nothing useful to report
 		}
+		if !s.lim.Acquire(ctx) {
+			return
+		}
+		defer s.lim.Release()
 		full := task.SNMP.InventoryEveryN <= 1 || seq%uint64(task.SNMP.InventoryEveryN) == 0
 		s.reporter.EnqueueSNMP(probe.RunSNMPPoll(task, full))
 		return
@@ -317,7 +314,9 @@ func (s *Scheduler) execute(ctx context.Context, task probe.Task, seq uint64) {
 	sourceIPv6 := s.sourceIPv6
 	s.mu.RUnlock()
 
-	results := probe.Dispatch(ctx, task, sourceIPv4, sourceIPv6)
+	// Limiter slots are held per target inside Dispatch, not per task tick —
+	// a many-target task cannot exceed max_concurrency on its own.
+	results := probe.Dispatch(ctx, task, sourceIPv4, sourceIPv6, s.lim)
 	for _, r := range results {
 		s.reporter.Enqueue(r)
 	}
