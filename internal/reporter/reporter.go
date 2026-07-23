@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -215,19 +216,26 @@ func (r *Reporter) post(path string, body []byte, count int) bool {
 	}
 	defer resp.Body.Close()
 
-	switch {
-	case resp.StatusCode == http.StatusOK:
+	if resp.StatusCode == http.StatusOK {
 		slog.Debug("reporter: uploaded", "path", path, "count", count)
 		return true
+	}
+
+	// Non-200: read a bounded slice of the body so the actual server-side error
+	// text (e.g. a DB error the server only puts in the response, never in its
+	// own log) is visible here instead of silently discarded.
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+	switch {
 	case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
 		slog.Warn("reporter: server error — will retry",
-			"status", resp.StatusCode, "path", path, "count", count)
+			"status", resp.StatusCode, "path", path, "count", count, "body", string(respBody))
 		return false
 	default:
 		// Remaining 4xx: the server rejected this payload; identical retries
 		// cannot succeed, so drop it rather than wedge the buffer.
 		slog.Warn("reporter: server rejected batch — dropping",
-			"status", resp.StatusCode, "path", path, "count", count)
+			"status", resp.StatusCode, "path", path, "count", count, "body", string(respBody))
 		return true
 	}
 }
