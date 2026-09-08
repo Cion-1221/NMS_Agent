@@ -42,10 +42,9 @@ var (
 )
 
 // versionTransport injects X-Agent-Version and the agent's public IPs into
-// every outbound mTLS request. Public IPs are discovered by runIPRefresh via
-// the server's /my-ip reflection endpoint and updated here; they start empty
-// until the first successful discovery, at which point the server falls back
-// to c.ClientIP() for whichever family header is absent.
+// every outbound mTLS request. Public IPs are discovered via the server's
+// /my-ip reflection endpoint: once synchronously at startup (before the first
+// task poll, see main) and then every 24 h by runIPRefresh.
 type versionTransport struct {
 	base http.RoundTripper
 	ver  string
@@ -55,11 +54,30 @@ type versionTransport struct {
 	ipMu       sync.RWMutex
 	publicIPv4 string
 	publicIPv6 string
+	// discovered is set by the startup discovery. From then on every request also
+	// carries X-Agent-Stack, declaring exactly which address families the agent
+	// could use to reach the server. The server treats that as authoritative and
+	// drops a family that is no longer listed (e.g. IPv6 removed from the node),
+	// instead of keeping the last known address forever — so a restart is all it
+	// takes to leave the IPv6 mesh. Without the header the server only ever adds.
+	discovered bool
 }
 
-// setIPs stores newly discovered public IPs. A non-empty value overwrites the
-// cached one; empty values are ignored so a temporary failure on one family
-// does not clear a previously discovered address.
+// setStack stores the authoritative startup discovery: both values are
+// overwritten (an empty one means "this family is gone") and the stack
+// declaration is switched on.
+func (t *versionTransport) setStack(ipv4, ipv6 string) {
+	t.ipMu.Lock()
+	defer t.ipMu.Unlock()
+	t.publicIPv4, t.publicIPv6 = ipv4, ipv6
+	t.discovered = true
+}
+
+// setIPs merges a periodic refresh. A non-empty value overwrites the cached
+// one; empty values are ignored so a temporary failure on one family does not
+// clear a previously discovered address. Families only ever disappear through
+// setStack, i.e. on restart — a 24 h refresh hiccup must not silently switch
+// the mesh off for that family.
 func (t *versionTransport) setIPs(ipv4, ipv6 string) {
 	t.ipMu.Lock()
 	defer t.ipMu.Unlock()
@@ -77,7 +95,7 @@ func (t *versionTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	req.Header.Set("X-Agent-OS", t.os)
 	req.Header.Set("X-Agent-Arch", t.arch)
 	t.ipMu.RLock()
-	ipv4, ipv6 := t.publicIPv4, t.publicIPv6
+	ipv4, ipv6, discovered := t.publicIPv4, t.publicIPv6, t.discovered
 	t.ipMu.RUnlock()
 	if ipv4 != "" {
 		req.Header.Set("X-Agent-IPv4", ipv4)
@@ -85,57 +103,67 @@ func (t *versionTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	if ipv6 != "" {
 		req.Header.Set("X-Agent-IPv6", ipv6)
 	}
+	if discovered {
+		stack := make([]string, 0, 2)
+		if ipv4 != "" {
+			stack = append(stack, "v4")
+		}
+		if ipv6 != "" {
+			stack = append(stack, "v6")
+		}
+		if len(stack) > 0 {
+			req.Header.Set("X-Agent-Stack", strings.Join(stack, ","))
+		}
+	}
 	return t.base.RoundTrip(req)
 }
 
-// runIPRefresh queries the server's /my-ip endpoint over forced IPv4 and IPv6
-// connections to discover the agent's public addresses as seen by the server.
-// This correctly handles cloud NAT (GCP/AWS) where the local interface IP
-// differs from the public IP. Results are refreshed every 24 h.
-func runIPRefresh(ctx context.Context, certDir, reportURL string, vt *versionTransport) {
-	const interval = 24 * time.Hour
+// discoverPublicIPs queries the server's /my-ip endpoint over forced IPv4 and
+// IPv6 connections and returns the agent's public addresses as seen by the
+// server ("" for a family that could not reach it). This correctly handles
+// cloud NAT (GCP/AWS) where the local interface IP differs from the public IP.
+// Bounded by two 10 s timeouts.
+func discoverPublicIPs(ctx context.Context, certDir, reportURL string) (ipv4, ipv6 string) {
 	myIPURL := strings.TrimRight(reportURL, "/") + "/api/v1/agent-sync/my-ip"
-
-	detect := func() {
-		var ipv4, ipv6 string
-		for _, pair := range []struct {
-			network string
-			out     *string
-		}{
-			{"tcp4", &ipv4},
-			{"tcp6", &ipv6},
-		} {
-			c, err := cert.NewMTLSClientForFamily(certDir, 10*time.Second, pair.network)
-			if err != nil {
-				continue
-			}
-			reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, myIPURL, nil)
-			if err != nil {
-				cancel()
-				continue
-			}
-			resp, err := c.Do(req)
-			cancel()
-			if err != nil {
-				slog.Debug("ip refresh: request failed", "network", pair.network, "err", err)
-				continue
-			}
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				if ip := strings.TrimSpace(string(body)); net.ParseIP(ip) != nil {
-					*pair.out = ip
-				}
-			}
+	for _, pair := range []struct {
+		network string
+		out     *string
+	}{
+		{"tcp4", &ipv4},
+		{"tcp6", &ipv6},
+	} {
+		c, err := cert.NewMTLSClientForFamily(certDir, 10*time.Second, pair.network)
+		if err != nil {
+			continue
 		}
-		if ipv4 != "" || ipv6 != "" {
-			vt.setIPs(ipv4, ipv6)
-			slog.Info("ip refresh: public IPs updated", "ipv4", ipv4, "ipv6", ipv6)
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, myIPURL, nil)
+		if err != nil {
+			cancel()
+			continue
+		}
+		resp, err := c.Do(req)
+		cancel()
+		if err != nil {
+			slog.Debug("ip discovery: request failed", "network", pair.network, "err", err)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			if ip := strings.TrimSpace(string(body)); net.ParseIP(ip) != nil {
+				*pair.out = ip
+			}
 		}
 	}
+	return ipv4, ipv6
+}
 
-	detect() // run immediately on startup
+// runIPRefresh re-runs the public IP discovery every 24 h and merges the result
+// (see setIPs). The startup run is done synchronously in main before the
+// scheduler starts, so this loop only handles the periodic refreshes.
+func runIPRefresh(ctx context.Context, certDir, reportURL string, vt *versionTransport) {
+	const interval = 24 * time.Hour
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -143,7 +171,10 @@ func runIPRefresh(ctx context.Context, certDir, reportURL string, vt *versionTra
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			detect()
+			if ipv4, ipv6 := discoverPublicIPs(ctx, certDir, reportURL); ipv4 != "" || ipv6 != "" {
+				vt.setIPs(ipv4, ipv6)
+				slog.Info("ip refresh: public IPs updated", "ipv4", ipv4, "ipv6", ipv6)
+			}
 		}
 	}
 }
@@ -272,7 +303,6 @@ func main() {
 	}
 
 	// Wrap transport to inject X-Agent-Version and public IP headers on all mTLS requests.
-	// Public IPs start empty; runIPRefresh populates them after the first /my-ip query.
 	vt := &versionTransport{
 		base: mtlsClient.Transport,
 		ver:  version,
@@ -285,7 +315,19 @@ func main() {
 	go runCertRenewal(ctx, certDir, cfg.Server.ReportURL, mtlsClient, log)
 
 	// Public IP discovery — queries /my-ip via forced IPv4 and IPv6 connections so
-	// the server can display both addresses even when the agent is behind cloud NAT.
+	// the server sees both addresses even behind cloud NAT. The startup run is
+	// synchronous, before the scheduler starts: the very first task poll must
+	// already carry X-Agent-IPv4/IPv6/Stack, because the server derives mesh
+	// targets from the families this agent can actually use — a poll without them
+	// would get a single-family (or stale dual-stack) target list until the next
+	// cycle. Bounded by two 10 s timeouts; an unreachable server just leaves the
+	// headers empty and the server falls back to the TCP source address.
+	if ipv4, ipv6 := discoverPublicIPs(ctx, certDir, cfg.Server.ReportURL); ipv4 != "" || ipv6 != "" {
+		vt.setStack(ipv4, ipv6)
+		log.Info("public IP discovery complete", "ipv4", ipv4, "ipv6", ipv6)
+	} else {
+		log.Warn("public IP discovery failed on both families — server will use the TCP source address")
+	}
 	go runIPRefresh(ctx, certDir, cfg.Server.ReportURL, vt)
 
 	// ── Reporter & Scheduler ───────────────────────────────────────────────────

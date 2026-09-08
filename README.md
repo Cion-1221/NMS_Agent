@@ -77,7 +77,7 @@
 | 7 | **SNMP 探针代理** | 服务端把指派设备合成 `snmp_poll` 任务（目标/凭证/节奏随任务下发），支持 v1/v2c/v3、自定义 OID、接口表采集；凭证仅内存持有 |
 | 8 | **OTA 自动升级** | 服务端在任务响应中携带 `update` 指令，Agent 优雅停机 → 下载校验 SHA-256 → 原子替换二进制 → 原地重启 |
 | 9 | **批量上报 + 失败重试** | 双内存队列（探测 / SNMP）攒批，按批次大小或刷新间隔上传；失败批次保留缓冲、指数退避重试，不再整批丢弃 |
-| 10 | **公网 IP 自发现** | 强制 tcp4/tcp6 各连一次服务端 `/my-ip` 反射端点，穿透云 NAT 上报真实公网双栈地址 |
+| 10 | **公网 IP 自发现** | 强制 tcp4/tcp6 各连一次服务端 `/my-ip` 反射端点，穿透云 NAT 上报真实公网双栈地址；启动时同步完成再拉取任务，并以 `X-Agent-Stack` 声明可用地址族，重启即重新声明 |
 | 11 | **优雅停机** | 捕获 SIGINT/SIGTERM，宽限期内等待在途探测与上传完成 |
 | 12 | **跨平台静态编译** | 纯 Go + `CGO_ENABLED=0`，一套代码交叉编译 Linux / Windows / macOS × amd64 / arm64 |
 
@@ -393,7 +393,12 @@ slog JSON 格式；`log.file` 配置后由 lumberjack 托管轮转（大小 / �
 
 ### 4.7 公网 IP 自发现 — main.go
 
-启动时及之后每 24h，分别用强制 `tcp4` / `tcp6` 的 mTLS 客户端请求服务端 `GET /agent-sync/my-ip` 反射端点，取服务端视角的公网双栈地址 —— 正确处理云 NAT（GCP/AWS 内网卡地址 ≠ 公网地址）。发现结果注入后续所有 mTLS 请求的 `X-Agent-IPv4` / `X-Agent-IPv6` 头；某族探测失败不清空已缓存地址。
+分别用强制 `tcp4` / `tcp6` 的 mTLS 客户端请求服务端 `GET /agent-sync/my-ip` 反射端点，取服务端视角的公网双栈地址 —— 正确处理云 NAT（GCP/AWS 内网卡地址 ≠ 公网地址）。发现结果注入后续所有 mTLS 请求的 `X-Agent-IPv4` / `X-Agent-IPv6` 头。
+
+两种运行时机语义不同：
+
+- **启动时同步执行**（最多两次 10 秒超时），完成后才启动调度器，保证第一次任务拉取就带上地址头。结果是权威的：连不通的那一族视为不存在，并从此在每个请求带 `X-Agent-Stack: v4` / `v6` / `v4,v6` 声明可用地址族。服务端据此裁剪 meshping / meshmtr 的目标（只有 IPv4 的节点不会去测对端的 IPv6），也会清掉库里该节点不再具备的那一族地址——节点撤掉 IPv6 后重启 Agent 即生效。
+- **之后每 24h 后台刷新**：只用非空结果覆盖，某族探测失败不清空已缓存地址，避免一次刷新抖动把该族的互测静默关掉。一个地址族只会在重启时消失。
 
 ---
 
@@ -439,7 +444,7 @@ slog JSON 格式；`log.file` 配置后由 lumberjack 托管轮转（大小 / �
 - **`insecure_enroll` 影响面受限**：只放宽 enroll 端点（首次注册）的验证，mTLS 同步通道始终完整校验。
 - **provisioning token 一次性**：enroll 成功即失效，配置中可删除；后续鉴权全凭证书。
 - **OTA 完整性**：新二进制经 mTLS 通道下载 + SHA-256 校验后才替换。
-- **请求头指纹**：所有 mTLS 请求注入 `X-Agent-Version / X-Agent-OS / X-Agent-Arch / X-Agent-IPv4 / X-Agent-IPv6`，供服务端做版本管理与地址展示。
+- **请求头指纹**：所有 mTLS 请求注入 `X-Agent-Version / X-Agent-OS / X-Agent-Arch / X-Agent-IPv4 / X-Agent-IPv6 / X-Agent-Stack`，供服务端做版本管理、地址展示与 mesh 目标的地址族裁剪。
 
 ---
 
@@ -680,7 +685,7 @@ Agent 消费的全部服务端接口（`{enroll}` = `enroll_url`，`{sync}` = `r
 
 **SNMP 结论**：`device_id`、`collected_at`（unix 秒，服务端速率换算的时间基准）、`success`、`error_kind`、`latency_ms`、`uptime_ticks`、`has_inventory` + system 组字段、`values[]`（自定义 OID）、`has_interfaces` + `interfaces[]`（原始计数器）。
 
-**每请求注入头**：`X-Agent-Version`、`X-Agent-OS`、`X-Agent-Arch`、`X-Agent-IPv4`、`X-Agent-IPv6`。
+**每请求注入头**：`X-Agent-Version`、`X-Agent-OS`、`X-Agent-Arch`、`X-Agent-IPv4`、`X-Agent-IPv6`、`X-Agent-Stack`（启动自发现完成后声明可用地址族，`v4` / `v6` / `v4,v6`；新版服务端据此裁剪 mesh 目标并清理消失的地址族，旧服务端忽略）。
 
 ---
 
