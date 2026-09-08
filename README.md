@@ -399,6 +399,7 @@ slog JSON 格式；`log.file` 配置后由 lumberjack 托管轮转（大小 / �
 
 - **启动时同步执行**（最多两次 10 秒超时），完成后才启动调度器，保证第一次任务拉取就带上地址头。结果是权威的：连不通的那一族视为不存在，并从此在每个请求带 `X-Agent-Stack: v4` / `v6` / `v4,v6` 声明可用地址族。服务端据此裁剪 meshping / meshmtr 的目标（只有 IPv4 的节点不会去测对端的 IPv6），也会清掉库里该节点不再具备的那一族地址——节点撤掉 IPv6 后重启 Agent 即生效。
 - **之后每 24h 后台刷新**：只用非空结果覆盖，某族探测失败不清空已缓存地址，避免一次刷新抖动把该族的互测静默关掉。一个地址族只会在重启时消失。
+- **启动时两族都失败**（服务端短暂不可达、开机后 DNS 未就绪）：日志 `public IP discovery failed on both families`，后台每分钟重试，首次成功即作为权威声明；期间服务端退回 TCP 来源地址。每族的失败原因会以 Info 记录（`ip discovery: family unreachable`），单栈节点上另一族每次都会出现这条，属正常。
 
 ---
 
@@ -676,7 +677,7 @@ Agent 消费的全部服务端接口（`{enroll}` = `enroll_url`，`{sync}` = `r
 | POST | `{sync}/api/v1/agent-sync/results` | mTLS | 批量上传探测结果 |
 | POST | `{sync}/api/v1/agent-sync/snmp-results` | mTLS | 批量上传 SNMP 采集结论 |
 | POST | `{sync}/api/v1/agent-sync/renew-cert` | mTLS | 证书续签 |
-| GET | `{sync}/api/v1/agent-sync/my-ip` | mTLS | 公网 IP 反射（tcp4/tcp6 各查一次） |
+| GET | `{sync}/api/v1/agent-sync/my-ip` | mTLS | 公网 IP 反射（tcp4/tcp6 各查一次），响应 `{"ip": "<服务端所见来源地址>"}`；Agent 同时兼容裸 IP 文本 |
 | GET | `{sync}/api/v1/agent-sync/binary/{id}` | mTLS | 下载 OTA 新二进制 |
 
 **任务对象**（`tasks` 数组元素）：`task_id`、`type`、`interval_seconds`、`targets[]`、`address_family`（可选）、`skip_tls_verify`（httpcheck 专用）、`snmp{...}`（snmp_poll 专用）。

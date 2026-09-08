@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -89,6 +90,32 @@ func (t *versionTransport) setIPs(ipv4, ipv6 string) {
 	}
 }
 
+// isDiscovered reports whether an authoritative discovery has completed yet.
+func (t *versionTransport) isDiscovered() bool {
+	t.ipMu.RLock()
+	defer t.ipMu.RUnlock()
+	return t.discovered
+}
+
+// parseMyIPBody extracts the reflected address from a /my-ip response. The
+// server answers with JSON ({"ip": "203.0.113.5"}); a bare IP body is accepted
+// too so a plain-text server variant keeps working. Returns "" when neither
+// form yields a valid address.
+func parseMyIPBody(body []byte) string {
+	if ip := strings.TrimSpace(string(body)); net.ParseIP(ip) != nil {
+		return ip
+	}
+	var payload struct {
+		IP string `json:"ip"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil {
+		if ip := strings.TrimSpace(payload.IP); net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+	return ""
+}
+
 func (t *versionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	req.Header.Set("X-Agent-Version", t.ver)
@@ -145,37 +172,59 @@ func discoverPublicIPs(ctx context.Context, certDir, reportURL string) (ipv4, ip
 		resp, err := c.Do(req)
 		cancel()
 		if err != nil {
-			slog.Debug("ip discovery: request failed", "network", pair.network, "err", err)
+			// A family the node simply does not have fails here every time (e.g.
+			// tcp6 on an IPv4-only host) — that is expected, hence Info not Warn.
+			slog.Info("ip discovery: family unreachable", "network", pair.network, "err", err)
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			if ip := strings.TrimSpace(string(body)); net.ParseIP(ip) != nil {
-				*pair.out = ip
-			}
+		if resp.StatusCode != http.StatusOK {
+			slog.Warn("ip discovery: unexpected status", "network", pair.network, "status", resp.StatusCode)
+			continue
 		}
+		ip := parseMyIPBody(body)
+		if ip == "" {
+			slog.Warn("ip discovery: response did not contain an IP", "network", pair.network, "body", strings.TrimSpace(string(body)))
+			continue
+		}
+		*pair.out = ip
 	}
 	return ipv4, ipv6
 }
 
-// runIPRefresh re-runs the public IP discovery every 24 h and merges the result
-// (see setIPs). The startup run is done synchronously in main before the
-// scheduler starts, so this loop only handles the periodic refreshes.
+// runIPRefresh keeps the public IP discovery current. The startup run happens
+// synchronously in main; if it failed there (server briefly unreachable, DNS not
+// ready right after boot), this loop retries every minute and the first success
+// becomes the authoritative declaration (setStack) — otherwise the process
+// would never send X-Agent-Stack until its next restart. After that it refreshes
+// every 24 h and only merges (setIPs).
 func runIPRefresh(ctx context.Context, certDir, reportURL string, vt *versionTransport) {
-	const interval = 24 * time.Hour
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	const (
+		interval = 24 * time.Hour
+		retry    = time.Minute
+	)
 	for {
+		wait := interval
+		if !vt.isDiscovered() {
+			wait = retry
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if ipv4, ipv6 := discoverPublicIPs(ctx, certDir, reportURL); ipv4 != "" || ipv6 != "" {
-				vt.setIPs(ipv4, ipv6)
-				slog.Info("ip refresh: public IPs updated", "ipv4", ipv4, "ipv6", ipv6)
-			}
+		case <-time.After(wait):
 		}
+		ipv4, ipv6 := discoverPublicIPs(ctx, certDir, reportURL)
+		if ipv4 == "" && ipv6 == "" {
+			continue
+		}
+		if !vt.isDiscovered() {
+			vt.setStack(ipv4, ipv6)
+			slog.Info("public IP discovery complete (delayed)", "ipv4", ipv4, "ipv6", ipv6)
+			continue
+		}
+		vt.setIPs(ipv4, ipv6)
+		slog.Info("ip refresh: public IPs updated", "ipv4", ipv4, "ipv6", ipv6)
 	}
 }
 
