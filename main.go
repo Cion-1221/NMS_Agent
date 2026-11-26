@@ -55,6 +55,7 @@ type versionTransport struct {
 	ipMu       sync.RWMutex
 	publicIPv4 string
 	publicIPv6 string
+	caFP       string
 	// discovered is set by the startup discovery. From then on every request also
 	// carries X-Agent-Stack, declaring exactly which address families the agent
 	// could use to reach the server. The server treats that as authoritative and
@@ -72,6 +73,12 @@ func (t *versionTransport) setStack(ipv4, ipv6 string) {
 	defer t.ipMu.Unlock()
 	t.publicIPv4, t.publicIPv6 = ipv4, ipv6
 	t.discovered = true
+}
+
+func (t *versionTransport) setCAFP(fp string) {
+	t.ipMu.Lock()
+	defer t.ipMu.Unlock()
+	t.caFP = fp
 }
 
 // setIPs merges a periodic refresh. A non-empty value overwrites the cached
@@ -122,8 +129,11 @@ func (t *versionTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	req.Header.Set("X-Agent-OS", t.os)
 	req.Header.Set("X-Agent-Arch", t.arch)
 	t.ipMu.RLock()
-	ipv4, ipv6, discovered := t.publicIPv4, t.publicIPv6, t.discovered
+	ipv4, ipv6, caFP, discovered := t.publicIPv4, t.publicIPv6, t.caFP, t.discovered
 	t.ipMu.RUnlock()
+	if caFP != "" {
+		req.Header.Set("X-Agent-CA-FP", caFP)
+	}
 	if ipv4 != "" {
 		req.Header.Set("X-Agent-IPv4", ipv4)
 	}
@@ -152,45 +162,39 @@ func (t *versionTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 // Bounded by two 10 s timeouts.
 func discoverPublicIPs(ctx context.Context, certDir, reportURL string) (ipv4, ipv6 string) {
 	myIPURL := strings.TrimRight(reportURL, "/") + "/api/v1/agent-sync/my-ip"
-	for _, pair := range []struct {
-		network string
-		out     *string
-	}{
-		{"tcp4", &ipv4},
-		{"tcp6", &ipv6},
-	} {
-		c, err := cert.NewMTLSClientForFamily(certDir, 10*time.Second, pair.network)
+	probeFamily := func(network string) string {
+		c, err := cert.NewMTLSClientForFamily(certDir, 10*time.Second, network)
 		if err != nil {
-			continue
+			return ""
 		}
+		defer c.CloseIdleConnections()
+
 		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, myIPURL, nil)
 		if err != nil {
-			cancel()
-			continue
+			return ""
 		}
 		resp, err := c.Do(req)
-		cancel()
 		if err != nil {
-			// A family the node simply does not have fails here every time (e.g.
-			// tcp6 on an IPv4-only host) — that is expected, hence Info not Warn.
-			slog.Info("ip discovery: family unreachable", "network", pair.network, "err", err)
-			continue
+			slog.Info("ip discovery: family unreachable", "network", network, "err", err)
+			return ""
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			slog.Warn("ip discovery: unexpected status", "network", pair.network, "status", resp.StatusCode)
-			continue
+			slog.Warn("ip discovery: unexpected status", "network", network, "status", resp.StatusCode)
+			return ""
 		}
 		ip := parseMyIPBody(body)
 		if ip == "" {
-			slog.Warn("ip discovery: response did not contain an IP", "network", pair.network, "body", strings.TrimSpace(string(body)))
-			continue
+			slog.Warn("ip discovery: response did not contain an IP", "network", network, "body", strings.TrimSpace(string(body)))
+			return ""
 		}
-		*pair.out = ip
+		return ip
 	}
-	return ipv4, ipv6
+	return probeFamily("tcp4"), probeFamily("tcp6")
 }
 
 // runIPRefresh keeps the public IP discovery current. The startup run happens
@@ -229,11 +233,8 @@ func runIPRefresh(ctx context.Context, certDir, reportURL string, vt *versionTra
 }
 
 // runCertRenewal checks the mTLS certificate expiry once per day and renews it
-// automatically when fewer than 30 days remain. Because cert.NewMTLSClient
-// dials via DialTLSContext (re-reading the cert files from disk on every new
-// TLS connection), the renewed cert is picked up on the next connection
-// without an agent restart.
-func runCertRenewal(ctx context.Context, certDir, syncURL string, client *http.Client, log *slog.Logger) {
+// automatically when fewer than 30 days remain.
+func runCertRenewal(ctx context.Context, certDir, syncURL string, client *http.Client, vt *versionTransport, log *slog.Logger) {
 	const (
 		renewThreshold = 30 * 24 * time.Hour
 		checkInterval  = 24 * time.Hour
@@ -258,6 +259,10 @@ func runCertRenewal(ctx context.Context, certDir, syncURL string, client *http.C
 		if err := cert.Renew(client, syncURL, certDir); err != nil {
 			log.Error("cert renewal failed", "err", err)
 			return
+		}
+		client.CloseIdleConnections()
+		if vt != nil {
+			vt.setCAFP(cert.CAFingerprints(certDir))
 		}
 		log.Info("cert renewed successfully")
 	}
@@ -284,6 +289,9 @@ func main() {
 		fmt.Printf("nms-agent %s (commit %s, built %s)\n", version, commit, buildDate)
 		return
 	}
+
+	// Best-effort cleanup of "<exe>.old" left behind by a previous Windows OTA swap.
+	updater.CleanupOldBinary()
 
 	// Ignore SIGHUP so the agent survives SSH session disconnects and terminal
 	// detaches. Graceful shutdown is handled by SIGINT and SIGTERM only.
@@ -327,6 +335,8 @@ func main() {
 			cfg.Server.EnrollURL,
 			cfg.Server.ProvisioningToken,
 			hostname,
+			cfg.Agent.Region,
+			cfg.Agent.Tags,
 			certDir,
 			cfg.Server.InsecureEnroll,
 		)
@@ -351,26 +361,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Wrap transport to inject X-Agent-Version and public IP headers on all mTLS requests.
+	// Wrap transport to inject X-Agent-Version, CA trust fingerprints, and public IP headers.
 	vt := &versionTransport{
 		base: mtlsClient.Transport,
 		ver:  version,
 		os:   runtime.GOOS,
 		arch: runtime.GOARCH,
+		caFP: cert.CAFingerprints(certDir),
 	}
 	mtlsClient.Transport = vt
 
 	// Certificate auto-renewal — checks once per day, renews if < 30 days remain.
-	go runCertRenewal(ctx, certDir, cfg.Server.ReportURL, mtlsClient, log)
+	go runCertRenewal(ctx, certDir, cfg.Server.ReportURL, mtlsClient, vt, log)
 
 	// Public IP discovery — queries /my-ip via forced IPv4 and IPv6 connections so
-	// the server sees both addresses even behind cloud NAT. The startup run is
-	// synchronous, before the scheduler starts: the very first task poll must
-	// already carry X-Agent-IPv4/IPv6/Stack, because the server derives mesh
-	// targets from the families this agent can actually use — a poll without them
-	// would get a single-family (or stale dual-stack) target list until the next
-	// cycle. Bounded by two 10 s timeouts; an unreachable server just leaves the
-	// headers empty and the server falls back to the TCP source address.
+	// the server sees both addresses even behind cloud NAT.
 	if ipv4, ipv6 := discoverPublicIPs(ctx, certDir, cfg.Server.ReportURL); ipv4 != "" || ipv6 != "" {
 		vt.setStack(ipv4, ipv6)
 		log.Info("public IP discovery complete", "ipv4", ipv4, "ipv6", ipv6)
@@ -382,6 +387,9 @@ func main() {
 	// ── Reporter & Scheduler ───────────────────────────────────────────────────
 	rep := reporter.New(mtlsClient, cfg.Server.ReportURL, cfg.Server)
 	sched := scheduler.New(mtlsClient, cfg.Server.ReportURL, rep, cfg.Server, cfg.Runtime.MaxConcurrency)
+	sched.EnableCertSync(certDir, func() {
+		vt.setCAFP(cert.CAFingerprints(certDir))
+	})
 
 	var wg sync.WaitGroup
 
@@ -420,8 +428,11 @@ func main() {
 	case <-done:
 		log.Info("shutdown complete")
 	case <-time.After(cfg.Runtime.GracePeriod):
-		log.Warn("grace period exceeded — forcing exit")
-		os.Exit(1)
+		if pendingUpdate == nil {
+			log.Warn("grace period exceeded — forcing exit")
+			os.Exit(1)
+		}
+		log.Warn("grace period exceeded with pending OTA update — proceeding to apply update")
 	}
 
 	if pendingUpdate != nil {

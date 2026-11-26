@@ -42,7 +42,7 @@ jobs:
         run: |
           go mod tidy
           go vet ./...
-          go test ./...
+          go test -race ./...
 
       - name: Determine release version
         id: version
@@ -117,6 +117,9 @@ jobs:
           mkdir "${PKG_NAME}" "${PKG_NAME}/configs"
           cp ../README.md "${PKG_NAME}/"
           cp ../configs/config.yaml "${PKG_NAME}/configs/"
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            cp ../configs/nms-agent.service "${PKG_NAME}/configs/"
+          fi
 
           if [ "${{ matrix.goos }}" = "windows" ]; then
             mv "${BINARY_NAME}.exe" "${PKG_NAME}/"

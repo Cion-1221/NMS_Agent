@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -21,11 +22,25 @@ type Update struct {
 	FileSize int64  `json:"file_size"` // bytes; used to pre-allocate temp file
 }
 
+// CleanupOldBinary removes any leftover "<exe>.old" left behind by a previous
+// Windows in-place binary update. Safe to call unconditionally on startup.
+func CleanupOldBinary() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	_ = os.Remove(exe + ".old")
+}
+
 // Apply downloads the new binary from {syncURL}/api/v1/agent-sync/binary/{BinaryID}
-// using the mTLS client, verifies its SHA-256, atomically replaces the running
-// executable, then restarts the process.
+// using the mTLS client, verifies its SHA-256, replaces the running executable,
+// then restarts the process.
 // On Linux/Darwin the process is replaced in-place via syscall.Exec (same PID).
-// On Windows the process exits cleanly and the service manager restarts it.
+// On Windows the running image cannot be overwritten directly via MoveFileEx, so
+// it is first renamed to "<exe>.old" before moving the new binary into place.
 func Apply(client *http.Client, syncURL string, u Update) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -55,12 +70,41 @@ func Apply(client *http.Client, syncURL string, u Update) error {
 		return fmt.Errorf("chmod: %w", err)
 	}
 
-	if err := os.Rename(tmp, exe); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("replace binary: %w", err)
+	if err := replaceBinary(tmp, exe, runtime.GOOS == "windows"); err != nil {
+		return err
 	}
 
 	return restart(exe)
+}
+
+// replaceBinary swaps tmp into exe. When stageOld is true (Windows), the
+// currently running binary at exe is renamed aside to exe+".old" first (Windows
+// allows renaming a running image, whereas overwriting an existing running image
+// fails with ERROR_ACCESS_DENIED), with automatic rollback if placing tmp fails.
+func replaceBinary(tmp, exe string, stageOld bool) error {
+	if !stageOld {
+		if err := os.Rename(tmp, exe); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("replace binary: %w", err)
+		}
+		return nil
+	}
+
+	oldPath := exe + ".old"
+	_ = os.Remove(oldPath)
+	if err := os.Rename(exe, oldPath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("move running binary aside: %w", err)
+	}
+	if err := os.Rename(tmp, exe); err != nil {
+		_ = os.Rename(oldPath, exe)
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace binary: %w", err)
+	}
+	// Best-effort cleanup; on Windows the running image holds a lock until exit,
+	// so CleanupOldBinary() removes it on the next process startup.
+	_ = os.Remove(oldPath)
+	return nil
 }
 
 // download fetches url into a temp file inside dir, computing SHA-256 on the fly.

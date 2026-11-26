@@ -1,0 +1,36 @@
+[Unit]
+Description=NMS Agent — distributed network probe edge node
+Documentation=https://github.com/Cion-1221/NMS_Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nms-agent
+Group=nms-agent
+WorkingDirectory=/var/lib/nms-agent
+ExecStart=/var/lib/nms-agent/bin/nms-agent -config /etc/nms-agent/config.yaml
+Restart=on-failure
+RestartSec=10s
+# Slightly longer than runtime.grace_period (30s) so graceful shutdown finishes cleanly.
+TimeoutStopSec=35s
+
+EnvironmentFile=-/etc/nms-agent/env
+
+# Grant raw socket capability without running as root (required by ICMP ping & traceroute).
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+# /var/lib/nms-agent covers both .certs/ and bin/ (OTA stages temp binary next to executable).
+ReadWritePaths=/var/log/nms-agent /var/lib/nms-agent
+
+[Install]
+WantedBy=multi-user.target

@@ -131,7 +131,8 @@ NMS_Agent/
 ├── go.mod / go.sum
 ├── main.go                      # 入口：配置 / 证书 / mTLS / 后台协程 / OTA 编排
 ├── configs/
-│   └── config.yaml              # Bootstrap 配置（4 个顶级块）
+│   ├── config.yaml              # Bootstrap 配置（4 个顶级块）
+│   └── nms-agent.service        # 生产级最小权限 systemd 单元模板（CAP_NET_RAW）
 ├── .certs/                      # 证书目录（运行时生成，勿提交版本库）
 │   ├── ca.crt                   #   服务端 CA 证书
 │   ├── client.crt               #   Agent 客户端证书
@@ -213,9 +214,9 @@ nms-agent -version         打印版本 / commit / 构建时间后退出
 
 ```yaml
 agent:
-  id: ""                  # 留空；enroll 后从 .certs/agent_id 读取
-  region: "HKG"           # 区域标识（当前仅用于本地日志）
-  tags:                   # 自定义标签（当前仅本地保留，暂未随协议上报）
+  id: ""                  # 已弃用/运行时忽略；enroll 后权威 ID 从 .certs/agent_id 读取
+  region: "HKG"           # 区域标识（随首次 enroll 上报，并输出至启动日志）
+  tags:                   # 自定义标签（随首次 enroll 上报）
     role: "edge"
   hostname_override: ""   # 留空时 enroll 用 os.Hostname()
 ```
@@ -240,10 +241,10 @@ agent:
 | `log.file` | `logs/nms-agent.log` | 留空输出 stderr；systemd 场景建议绝对路径 |
 | `log.level` | `info` | 日志级别：`debug` / `info` / `warn` / `error`（排障时开 debug 可看到调度调和、上传明细） |
 | `log.max_size_mb` | `100` | 按大小轮转（lumberjack） |
-| `log.max_age_days` | `30` | 轮转文件保留天数 |
+| `log.age_days` / `log.max_age_days` | `30` | 轮转文件保留天数 |
 | `log.max_backups` | `30` | 轮转文件保留个数 |
 | `log.compress` | `true` | gzip 压缩旧日志 |
-| `grace_period` | `30s` | 收到停机信号后等待在途工作的上限 |
+| `grace_period` | `30s` | 收到停机信号后等待在途工作的上限（OTA 挂起时超限仍继续应用升级，不丢弃更新） |
 | `max_concurrency` | `20` | 并发探测任务上限（信号量） |
 
 ### 3.4 certs 块 — 证书目录
@@ -255,7 +256,7 @@ certs:
 
 ### 3.5 敏感信息与环境变量
 
-配置文件在加载前整体做 `${ENV_VAR}` 展开，`provisioning_token: "${NMS_TOKEN}"` 即可从环境变量注入，配置文件本身可安全入库。推荐 systemd `EnvironmentFile=` 或容器 Secret 注入。
+配置文件加载时仅对非注释行做严格的 `${ENV_VAR}` 占位符展开（裸 `$` 字面量原样保留，未定义变量输出告警日志），`provisioning_token: "${NMS_TOKEN}"` 即可从环境变量安全注入。推荐配合 [`configs/nms-agent.service`](configs/nms-agent.service) 的 `EnvironmentFile=` 或容器 Secret 使用。
 
 ---
 

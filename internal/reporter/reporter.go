@@ -92,20 +92,47 @@ type pendingBatch[T any] struct {
 func (p *pendingBatch[T]) add(v T) {
 	p.buf = append(p.buf, v)
 	if drop := len(p.buf) - p.max; drop > 0 {
-		p.buf = p.buf[drop:]
+		rem := len(p.buf) - drop
+		copy(p.buf, p.buf[drop:])
+		clear(p.buf[rem:])
+		p.buf = p.buf[:rem]
 		slog.Warn("reporter: retry buffer full — dropping oldest results",
 			"kind", p.kind, "dropped", drop)
 	}
 }
 
-// flush attempts an upload unless the buffer is empty or a backoff window is
-// active. force ignores the backoff — used for the final drain before exit.
-func (p *pendingBatch[T]) flush(force bool, upload func([]T) bool) {
+// flush uploads buffered entries in chunks of at most batchSize unless the
+// buffer is empty or a backoff window is active. force ignores backoff for the
+// final shutdown drain. Chunking ensures a post-outage backlog (up to 1000 items)
+// drains in normal-sized requests instead of timing out as one giant payload,
+// and compacts/clears sent slots so backing arrays do not retain large strings.
+func (p *pendingBatch[T]) flush(batchSize int, force bool, upload func([]T) bool) {
 	if len(p.buf) == 0 || (!force && time.Now().Before(p.retryAt)) {
 		return
 	}
-	if upload(p.buf) {
-		p.buf = p.buf[:0]
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	sent := 0
+	failed := false
+	for sent < len(p.buf) {
+		end := min(sent+batchSize, len(p.buf))
+		if !upload(p.buf[sent:end]) {
+			failed = true
+			break
+		}
+		sent = end
+	}
+	if sent > 0 {
+		rem := len(p.buf) - sent
+		copy(p.buf, p.buf[sent:])
+		clear(p.buf[rem:])
+		p.buf = p.buf[:rem]
+	}
+	if !failed {
+		if cap(p.buf) > batchSize*4 {
+			p.buf = make([]T, 0, batchSize)
+		}
 		p.retryDelay = 0
 		p.retryAt = time.Time{}
 		return
@@ -126,7 +153,11 @@ func (p *pendingBatch[T]) flush(force bool, upload func([]T) bool) {
 // buffered and are retried with backoff. Drains remaining items on context
 // cancellation before returning.
 func (r *Reporter) Run(ctx context.Context) {
-	maxBuf := r.cfg.BatchSize * 10
+	batchSize := r.cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	maxBuf := batchSize * 10
 	if maxBuf < 1000 {
 		maxBuf = 1000
 	}
@@ -139,19 +170,19 @@ func (r *Reporter) Run(ctx context.Context) {
 		select {
 		case res := <-r.queue:
 			results.add(res)
-			if len(results.buf) >= r.cfg.BatchSize {
-				results.flush(false, r.upload)
+			if len(results.buf) >= batchSize {
+				results.flush(batchSize, false, r.upload)
 			}
 
 		case res := <-r.snmpQueue:
 			snmp.add(res)
-			if len(snmp.buf) >= r.cfg.BatchSize {
-				snmp.flush(false, r.uploadSNMP)
+			if len(snmp.buf) >= batchSize {
+				snmp.flush(batchSize, false, r.uploadSNMP)
 			}
 
 		case <-ticker.C:
-			results.flush(false, r.upload)
-			snmp.flush(false, r.uploadSNMP)
+			results.flush(batchSize, false, r.upload)
+			snmp.flush(batchSize, false, r.uploadSNMP)
 
 		case <-ctx.Done():
 			// Drain whatever is still sitting in the channels, then make one
@@ -163,8 +194,8 @@ func (r *Reporter) Run(ctx context.Context) {
 				case res := <-r.snmpQueue:
 					snmp.add(res)
 				default:
-					results.flush(true, r.upload)
-					snmp.flush(true, r.uploadSNMP)
+					results.flush(batchSize, true, r.upload)
+					snmp.flush(batchSize, true, r.uploadSNMP)
 					return
 				}
 			}

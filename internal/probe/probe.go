@@ -244,7 +244,7 @@ func famProbesFor(addressFamily, host string) []famProbe {
 // resolveTargetIP resolves host to a single literal IP within family
 // ("ip4"/"ip6"; "" = system preference). Literal IPs pass through untouched.
 // Resolving here (instead of at dial time) guarantees the probed address and
-// the source-IP family can never disagree.
+// the source-IP family can never disagree. Bounded by a 5 s lookup timeout.
 func resolveTargetIP(ctx context.Context, host, family string) (string, error) {
 	if net.ParseIP(host) != nil {
 		return host, nil
@@ -253,7 +253,9 @@ func resolveTargetIP(ctx context.Context, host, family string) (string, error) {
 	if family != "" {
 		network = family
 	}
-	addrs, err := net.DefaultResolver.LookupIP(ctx, network, host)
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIP(lookupCtx, network, host)
 	if err != nil {
 		return "", err
 	}
@@ -278,7 +280,7 @@ func sourceIPForIP(ipStr, sourceIPv4, sourceIPv6 string) string {
 
 // sourceIPForFamily returns the configured source address for a forced
 // resolution family ("ip4"/"ip6"). Unrestricted family returns "" — callers
-// fall back to per-target family detection (pickSourceIP).
+// fall back to per-target family detection (pickSourceIPContext).
 func sourceIPForFamily(family, sourceIPv4, sourceIPv6 string) string {
 	switch family {
 	case "ip4":
@@ -289,10 +291,9 @@ func sourceIPForFamily(family, sourceIPv4, sourceIPv6 string) string {
 	return ""
 }
 
-// pickSourceIP returns the source IP that matches the address family of host.
-// It checks net.ParseIP first (no I/O) and falls back to a DNS lookup for
-// hostnames. Returns "" when the family cannot be determined.
-func pickSourceIP(host, sourceIPv4, sourceIPv6 string) string {
+// pickSourceIPContext returns the source IP matching the address family of host,
+// respecting ctx and a 5 s DNS lookup ceiling for domain names.
+func pickSourceIPContext(ctx context.Context, host, sourceIPv4, sourceIPv6 string) string {
 	if sourceIPv4 == "" && sourceIPv6 == "" {
 		return ""
 	}
@@ -302,14 +303,19 @@ func pickSourceIP(host, sourceIPv4, sourceIPv6 string) string {
 		}
 		return sourceIPv6
 	}
-	addrs, err := net.LookupHost(host)
-	if err != nil || len(addrs) == 0 {
+	ipStr, err := resolveTargetIP(ctx, host, "")
+	if err != nil {
 		return sourceIPv4
 	}
-	if ip := net.ParseIP(addrs[0]); ip != nil && ip.To4() == nil {
+	if ip := net.ParseIP(ipStr); ip != nil && ip.To4() == nil {
 		return sourceIPv6
 	}
 	return sourceIPv4
+}
+
+// pickSourceIP wraps pickSourceIPContext with a background context (5 s lookup cap).
+func pickSourceIP(host, sourceIPv4, sourceIPv6 string) string {
+	return pickSourceIPContext(context.Background(), host, sourceIPv4, sourceIPv6)
 }
 
 // msPtr converts a duration to a *float64 milliseconds pointer for the Result field.

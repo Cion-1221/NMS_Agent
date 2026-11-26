@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
+	"time"
 )
 
 type mtrHop struct {
@@ -49,6 +51,12 @@ func runMTR(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string, lim L
 func doMTR(ctx context.Context, taskID int, taskType, target string, fp famProbe, sourceIPv4, sourceIPv6 string) Result {
 	r := Result{TaskID: taskID, Type: taskType, Target: target + fp.label}
 
+	cleanTarget := strings.TrimSpace(target)
+	if cleanTarget == "" || strings.HasPrefix(cleanTarget, "-") {
+		r.Detail = "invalid mtr target: must not be empty or start with '-'"
+		return r
+	}
+
 	if runtime.GOOS == "windows" {
 		r.Detail = "mtr is not available on Windows; use traceroute (requires admin) or tcpping instead"
 		return r
@@ -58,6 +66,9 @@ func doMTR(ctx context.Context, taskID int, taskType, target string, fp famProbe
 		r.Detail = "mtr binary not found in PATH (install mtr or mtr-tiny)"
 		return r
 	}
+
+	mtrCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
 
 	args := []string{
 		"--report", "--json", "--no-dns",
@@ -74,14 +85,14 @@ func doMTR(ctx context.Context, taskID int, taskType, target string, fp famProbe
 	// mtr --address binds the probe socket; pick the source matching the target family.
 	src := sourceIPForFamily(fp.family, sourceIPv4, sourceIPv6)
 	if src == "" && fp.family == "" {
-		src = pickSourceIP(target, sourceIPv4, sourceIPv6)
+		src = pickSourceIPContext(mtrCtx, cleanTarget, sourceIPv4, sourceIPv6)
 	}
 	if src != "" {
 		args = append(args, "--address", src)
 	}
-	args = append(args, target)
+	args = append(args, "--", cleanTarget)
 
-	cmd := exec.CommandContext(ctx, mtrBinary, args...)
+	cmd := exec.CommandContext(mtrCtx, mtrBinary, args...)
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 
 	var stdout, stderr bytes.Buffer

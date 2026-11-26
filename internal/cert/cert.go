@@ -6,8 +6,10 @@ package cert
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -15,7 +17,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,8 +31,10 @@ const (
 )
 
 type enrollRequest struct {
-	Token    string `json:"provisioning_token"`
-	Hostname string `json:"hostname"`
+	Token    string            `json:"provisioning_token"`
+	Hostname string            `json:"hostname"`
+	Region   string            `json:"region,omitempty"`
+	Tags     map[string]string `json:"tags,omitempty"`
 }
 
 type enrollResponse struct {
@@ -61,15 +67,21 @@ func HasCerts(dir string) bool {
 // On success it writes the four credential files into dir and returns the assigned AgentID.
 // insecure allows skipping TLS verification of the enroll endpoint (useful when the server
 // uses a self-signed cert that the agent doesn't yet trust).
-func Enroll(enrollURL, token, hostname, dir string, insecure bool) (string, error) {
+func Enroll(enrollURL, token, hostname, region string, tags map[string]string, dir string, insecure bool) (string, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure}, //nolint:gosec
 		},
 	}
+	defer client.CloseIdleConnections()
 
-	body, _ := json.Marshal(enrollRequest{Token: token, Hostname: hostname})
+	body, _ := json.Marshal(enrollRequest{
+		Token:    token,
+		Hostname: hostname,
+		Region:   region,
+		Tags:     tags,
+	})
 	resp, err := client.Post(
 		strings.TrimRight(enrollURL, "/")+"/api/v1/agents/enroll",
 		"application/json",
@@ -96,6 +108,9 @@ func Enroll(enrollURL, token, hostname, dir string, insecure bool) (string, erro
 	if _, err := tls.X509KeyPair([]byte(er.CertPEM), []byte(er.KeyPEM)); err != nil {
 		return "", fmt.Errorf("enroll: server returned mismatched cert/key: %w", err)
 	}
+	if _, err := normalizeCertBundlePEM([]byte(er.CACertPEM)); err != nil {
+		return "", fmt.Errorf("enroll: invalid CA cert PEM: %w", err)
+	}
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create cert dir %s: %w", dir, err)
@@ -112,6 +127,93 @@ func Enroll(enrollURL, token, hostname, dir string, insecure bool) (string, erro
 	}
 
 	return er.AgentID, nil
+}
+
+// normalizeCertBundlePEM parses all CERTIFICATE blocks from raw PEM, validates each
+// X.509 certificate, deduplicates by fingerprint, and returns canonical PEM bytes.
+func normalizeCertBundlePEM(raw []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	seen := make(map[string]bool, 4)
+	count := 0
+	rest := raw
+	for len(rest) > 0 {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(c.Raw)
+		fp := hex.EncodeToString(sum[:8])
+		if seen[fp] {
+			continue
+		}
+		seen[fp] = true
+		count++
+		_ = pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes})
+	}
+	if count == 0 {
+		return nil, fmt.Errorf("no valid CERTIFICATE PEM blocks")
+	}
+	return buf.Bytes(), nil
+}
+
+// CAFingerprints returns comma-joined sorted 16-hex SHA-256 prefixes of all CA
+// certificates stored in dir/ca.crt (matches server core.CertFingerprint).
+func CAFingerprints(dir string) string {
+	raw, err := os.ReadFile(filepath.Join(dir, fileCACert))
+	if err != nil {
+		return ""
+	}
+	seen := make(map[string]bool, 4)
+	var fps []string
+	rest := raw
+	for len(rest) > 0 {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		sum := sha256.Sum256(c.Raw)
+		fp := hex.EncodeToString(sum[:8])
+		if !seen[fp] {
+			seen[fp] = true
+			fps = append(fps, fp)
+		}
+	}
+	sort.Strings(fps)
+	return strings.Join(fps, ",")
+}
+
+// UpdateCABundle validates bundlePEM and atomically updates dir/ca.crt only when
+// the normalized certificate set differs from what is already on disk.
+func UpdateCABundle(dir, bundlePEM string) (bool, error) {
+	nextNorm, err := normalizeCertBundlePEM([]byte(bundlePEM))
+	if err != nil {
+		return false, fmt.Errorf("validate CA bundle: %w", err)
+	}
+	if curRaw, err := os.ReadFile(filepath.Join(dir, fileCACert)); err == nil {
+		if curNorm, err := normalizeCertBundlePEM(curRaw); err == nil && bytes.Equal(curNorm, nextNorm) {
+			return false, nil
+		}
+	}
+	if err := writeCredFiles(dir, []credFile{{fileCACert, string(nextNorm), 0o644}}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // credFile is one credential file to persist.
@@ -196,9 +298,7 @@ func CertExpiry(dir string) (time.Time, error) {
 }
 
 // Renew calls POST /api/v1/agent-sync/renew-cert using the current mTLS client
-// and overwrites the cert files on disk. Because NewMTLSClient uses DialTLSContext
-// (reads certs from disk on every new TLS connection), subsequent connections
-// automatically use the renewed certificate and CA without an agent restart.
+// and overwrites the cert files on disk.
 func Renew(client *http.Client, syncURL, certDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -236,32 +336,112 @@ func Renew(client *http.Client, syncURL, certDir string) error {
 		{fileKey, rr.KeyPEM, 0o600},
 	}
 	if rr.CACertPEM != "" {
-		files = append(files, credFile{fileCACert, rr.CACertPEM, 0o644})
+		if normCA, err := normalizeCertBundlePEM([]byte(rr.CACertPEM)); err == nil {
+			files = append(files, credFile{fileCACert, string(normCA), 0o644})
+		}
 	}
 	return writeCredFiles(certDir, files)
 }
 
-// dialMTLS establishes a TLS connection for mTLS, reading the CA cert and client
-// cert+key fresh from disk each call. This ensures CA rotation and cert renewal
-// take effect on the next new connection without an agent restart.
-func dialMTLS(ctx context.Context, network, addr, caFile, certFile, keyFile string) (net.Conn, error) {
-	caPEM, err := os.ReadFile(caFile)
+// certReloader caches the parsed Root CA pool and client X.509 keypair in memory,
+// re-parsing from disk only when file (ModTime, Size) metadata changes.
+type certReloader struct {
+	caFile   string
+	certFile string
+	keyFile  string
+
+	mu       sync.RWMutex
+	caMod    time.Time
+	caSize   int64
+	certMod  time.Time
+	certSize int64
+	keyMod   time.Time
+	keySize  int64
+	pool     *x509.CertPool
+	pair     tls.Certificate
+}
+
+func newCertReloader(dir string) (*certReloader, error) {
+	r := &certReloader{
+		caFile:   filepath.Join(dir, fileCACert),
+		certFile: filepath.Join(dir, fileCert),
+		keyFile:  filepath.Join(dir, fileKey),
+	}
+	if _, _, err := r.load(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *certReloader) load() (*x509.CertPool, tls.Certificate, error) {
+	caSt, err := os.Stat(r.caFile)
 	if err != nil {
-		return nil, fmt.Errorf("read CA cert: %w", err)
+		return nil, tls.Certificate{}, fmt.Errorf("stat CA cert: %w", err)
+	}
+	certSt, err := os.Stat(r.certFile)
+	if err != nil {
+		return nil, tls.Certificate{}, fmt.Errorf("stat client cert: %w", err)
+	}
+	keySt, err := os.Stat(r.keyFile)
+	if err != nil {
+		return nil, tls.Certificate{}, fmt.Errorf("stat client key: %w", err)
+	}
+
+	r.mu.RLock()
+	if r.pool != nil &&
+		caSt.ModTime().Equal(r.caMod) && caSt.Size() == r.caSize &&
+		certSt.ModTime().Equal(r.certMod) && certSt.Size() == r.certSize &&
+		keySt.ModTime().Equal(r.keyMod) && keySt.Size() == r.keySize {
+		pool, pair := r.pool, r.pair
+		r.mu.RUnlock()
+		return pool, pair, nil
+	}
+	r.mu.RUnlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pool != nil &&
+		caSt.ModTime().Equal(r.caMod) && caSt.Size() == r.caSize &&
+		certSt.ModTime().Equal(r.certMod) && certSt.Size() == r.certSize &&
+		keySt.ModTime().Equal(r.keyMod) && keySt.Size() == r.keySize {
+		return r.pool, r.pair, nil
+	}
+
+	caPEM, err := os.ReadFile(r.caFile)
+	if err != nil {
+		return nil, tls.Certificate{}, fmt.Errorf("read CA cert: %w", err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("parse CA cert: no valid PEM blocks")
+		return nil, tls.Certificate{}, fmt.Errorf("parse CA cert: no valid PEM blocks")
 	}
-
-	clientCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	pair, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("load client cert/key: %w", err)
+		return nil, tls.Certificate{}, fmt.Errorf("load client cert/key: %w", err)
 	}
 
-	host, _, _ := net.SplitHostPort(addr)
+	r.caMod, r.caSize = caSt.ModTime(), caSt.Size()
+	r.certMod, r.certSize = certSt.ModTime(), certSt.Size()
+	r.keyMod, r.keySize = keySt.ModTime(), keySt.Size()
+	r.pool = pool
+	r.pair = pair
+	return pool, pair, nil
+}
+
+func (r *certReloader) dialMTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+	pool, clientCert, err := r.load()
+	if err != nil {
+		return nil, err
+	}
+	host, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		host = addr
+	}
 	tlsDialer := &tls.Dialer{
-		NetDialer: &net.Dialer{},
+		NetDialer: &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		},
 		Config: &tls.Config{
 			Certificates: []tls.Certificate{clientCert},
 			RootCAs:      pool,
@@ -273,32 +453,21 @@ func dialMTLS(ctx context.Context, network, addr, caFile, certFile, keyFile stri
 }
 
 // NewMTLSClient builds an http.Client that presents the agent's client certificate
-// and trusts only the NMS server's CA. Both the CA cert and client cert are read
-// from disk on every new TLS connection so that CA rotation and cert renewal take
-// effect immediately without an agent restart.
+// and trusts only the NMS server's CA bundle, automatically picking up on-disk
+// CA rotations and certificate renewals without restarting the process.
 func NewMTLSClient(dir string, timeout time.Duration) (*http.Client, error) {
-	caFile := filepath.Join(dir, fileCACert)
-	certFile := filepath.Join(dir, fileCert)
-	keyFile := filepath.Join(dir, fileKey)
-
-	// Validate files exist and are parseable at startup so errors surface immediately.
-	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
-		return nil, fmt.Errorf("load client cert/key: %w", err)
-	}
-	caPEM, err := os.ReadFile(caFile)
+	reloader, err := newCertReloader(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read CA cert: %w", err)
+		return nil, err
 	}
-	if !x509.NewCertPool().AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("parse CA cert: no valid PEM blocks")
-	}
-
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			// Re-read both certs from disk on every new TLS connection.
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     90 * time.Second,
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialMTLS(ctx, network, addr, caFile, certFile, keyFile)
+				return reloader.dialMTLS(ctx, network, addr)
 			},
 		},
 	}, nil
@@ -306,30 +475,19 @@ func NewMTLSClient(dir string, timeout time.Duration) (*http.Client, error) {
 
 // NewMTLSClientForFamily is like NewMTLSClient but restricts all TCP connections
 // to the given address family: "tcp4" for IPv4-only, "tcp6" for IPv6-only.
-// Used to query the server's /my-ip reflection endpoint over each family
-// separately, so the agent can discover its public addresses behind NAT.
 func NewMTLSClientForFamily(dir string, timeout time.Duration, network string) (*http.Client, error) {
-	caFile := filepath.Join(dir, fileCACert)
-	certFile := filepath.Join(dir, fileCert)
-	keyFile := filepath.Join(dir, fileKey)
-
-	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
-		return nil, fmt.Errorf("load client cert/key: %w", err)
-	}
-	caPEM, err := os.ReadFile(caFile)
+	reloader, err := newCertReloader(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read CA cert: %w", err)
+		return nil, err
 	}
-	if !x509.NewCertPool().AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("parse CA cert: no valid PEM blocks")
-	}
-
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
+			MaxIdleConns:        4,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
 			DialTLSContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-				// Force the specified network family (tcp4 or tcp6).
-				return dialMTLS(ctx, network, addr, caFile, certFile, keyFile)
+				return reloader.dialMTLS(ctx, network, addr)
 			},
 		},
 	}, nil

@@ -2,14 +2,16 @@
 # NMS Agent Bootstrap Configuration
 #
 # This is the minimal config needed to enroll and run the agent.
-# Sensitive values support ${ENV_VAR} expansion — prefer environment variables
-# over plain-text secrets in this file.
+# Sensitive values support strict ${ENV_VAR} expansion (bare '$' characters in
+# tokens/URLs and '#' comment lines are left untouched) — prefer environment
+# variables over plain-text secrets in this file.
 # ============================================================================
 
 agent:
-  # id: leave empty on first boot; the server assigns one during enrollment.
-  # After enrollment the agent reads its ID from .certs/agent_id.
+  # id: deprecated/ignored at runtime; after enrollment the authoritative ID is
+  # read from <certs.dir>/agent_id.
   id: ""
+  # region & tags: sent to the server during initial enrollment.
   region: "HKG"
   tags:
     role: "edge"

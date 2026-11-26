@@ -1,3 +1,6 @@
 nms-agent*
+!configs/nms-agent.service
+.certs/
+logs/
 .env
 

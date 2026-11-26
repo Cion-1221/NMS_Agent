@@ -68,6 +68,9 @@ func doTraceroute(ctx context.Context, taskID int, taskType, target string, fp f
 		return r
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, 95*time.Second)
+	defer cancel()
+
 	// Family-restricted resolution for domain targets (literal IPs pass through).
 	ipStr, err := resolveTargetIP(ctx, target, fp.family)
 	if err != nil {
@@ -104,6 +107,13 @@ func doTraceroute(ctx context.Context, taskID int, taskType, target string, fp f
 	}
 	defer conn.Close()
 
+	// Immediately wake a blocked ReadFrom when ctx is cancelled (e.g. OTA update
+	// or task removal) instead of waiting out the 3 s hop deadline.
+	stopWake := context.AfterFunc(ctx, func() {
+		_ = conn.SetReadDeadline(time.Now())
+	})
+	defer stopWake()
+
 	id := int(traceID.Add(1) & 0xffff)
 	dstAddr := &net.IPAddr{IP: dstIP}
 	var detail traceDetail
@@ -114,6 +124,9 @@ func doTraceroute(ctx context.Context, taskID int, taskType, target string, fp f
 		}
 
 		ip, rttMs, timedOut := probeHop(conn, dstAddr, params, ttl, id)
+		if ctx.Err() != nil {
+			break
+		}
 		hop := traceHop{TTL: ttl, IP: ip, RTTMs: rttMs, Timeout: timedOut}
 		detail.Hops = append(detail.Hops, hop)
 

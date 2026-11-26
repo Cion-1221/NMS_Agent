@@ -10,6 +10,7 @@
 package probe
 
 import (
+	"context"
 	"math/big"
 	"sort"
 	"strconv"
@@ -42,12 +43,6 @@ var v3PrivProtos = map[string]gosnmp.SnmpV3PrivProtocol{
 }
 
 // classifySNMPError buckets a gosnmp error into the server's error_kind enum.
-// v3 has explicit authentication failures; under v1/v2c a wrong community just
-// looks like a timeout — protocol limitation, the server wording covers it.
-// notInTimeWindow must be checked BEFORE the usm match: it is the v3 time-sync
-// signal (gosnmp resyncs via the Report PDU and retries automatically); a rare
-// leftover is clock drift, not a credential problem — classify as snmp_error
-// so the server does not surface a misleading auth_fail.
 func classifySNMPError(err error) string {
 	e := strings.ToLower(err.Error())
 	switch {
@@ -57,18 +52,21 @@ func classifySNMPError(err error) string {
 		strings.Contains(e, "unknown user"), strings.Contains(e, "wrong digest"),
 		strings.Contains(e, "decryption"):
 		return "auth_fail"
-	case strings.Contains(e, "timeout"):
+	case strings.Contains(e, "timeout"), strings.Contains(e, "deadline"), strings.Contains(e, "canceled"):
 		return "snmp_timeout"
 	default:
 		return "snmp_error"
 	}
 }
 
-// RunSNMPPoll executes one poll against the task's single target device.
-// full=true fetches the complete system group, false only sysUpTime. Custom
-// OIDs (params.ExtraOIDs) ride along on every poll regardless of cadence.
-func RunSNMPPoll(task Task, full bool) SNMPResult {
+// RunSNMPPoll executes one poll against the task's single target device,
+// binding the outbound UDP socket to sourceIPv4/sourceIPv6 when configured and
+// honouring ctx cancellation during long interface-table walks.
+func RunSNMPPoll(ctx context.Context, task Task, full bool, sourceIPv4, sourceIPv6 string) SNMPResult {
 	p := task.SNMP
+	if p == nil {
+		return SNMPResult{CollectedAt: time.Now().Unix(), ErrorKind: "snmp_error", Error: "missing snmp params"}
+	}
 	res := SNMPResult{DeviceID: p.DeviceID, HasInventory: full, CollectedAt: time.Now().Unix()}
 
 	if len(task.Targets) == 0 || task.Targets[0] == "" {
@@ -91,10 +89,12 @@ func RunSNMPPoll(task Task, full bool) SNMPResult {
 	}
 
 	g := &gosnmp.GoSNMP{
-		Target:  target,
-		Port:    uint16(port),
-		Timeout: timeout,
-		Retries: retries,
+		Target:    target,
+		Port:      uint16(port),
+		Timeout:   timeout,
+		Retries:   retries,
+		Context:   ctx,
+		LocalAddr: pickSourceIPContext(ctx, target, sourceIPv4, sourceIPv6),
 	}
 	switch p.Version {
 	case "3":

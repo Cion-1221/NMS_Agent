@@ -3,7 +3,9 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -54,6 +56,31 @@ type CertsConfig struct {
 	Dir string `mapstructure:"dir"`
 }
 
+var bracedEnvRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandBracedEnv expands only explicit ${VAR_NAME} placeholders outside '#'
+// comment lines. Bare '$foo' substrings in tokens/URLs are preserved verbatim,
+// and unset ${VAR_NAME} placeholders emit a structured warning.
+func expandBracedEnv(src string) string {
+	lines := strings.Split(src, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		lines[i] = bracedEnvRe.ReplaceAllStringFunc(line, func(match string) string {
+			sub := bracedEnvRe.FindStringSubmatch(match)
+			name := sub[1]
+			val, ok := os.LookupEnv(name)
+			if !ok {
+				slog.Warn("config: referenced environment variable is not set", "var", name)
+				return ""
+			}
+			return val
+		})
+	}
+	return strings.Join(lines, "\n")
+}
+
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -62,7 +89,7 @@ func Load(path string) (*Config, error) {
 
 	v := viper.New()
 	v.SetConfigType("yaml")
-	if err := v.ReadConfig(strings.NewReader(os.ExpandEnv(string(raw)))); err != nil {
+	if err := v.ReadConfig(strings.NewReader(expandBracedEnv(string(raw)))); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
 	}
 

@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
@@ -17,28 +18,29 @@ func runPing(ctx context.Context, task Task, sourceIPv4, sourceIPv6 string, lim 
 func doPing(ctx context.Context, taskID int, taskType, target string, fp famProbe, sourceIPv4, sourceIPv6 string) Result {
 	r := Result{TaskID: taskID, Type: taskType, Target: target + fp.label}
 
-	pinger := probing.New(target)
-	// Restrict domain resolution to the forced family ("ip4"/"ip6"); the
-	// default network "ip" follows system preference (historical behavior).
-	if fp.family != "" {
-		pinger.SetNetwork(fp.family)
-	}
-
-	if err := pinger.Resolve(); err != nil {
+	// Resolve via context-aware resolver (5 s bound) instead of pinger.Resolve()
+	// so unresponsive system DNS cannot block shutdown or starve limiter slots.
+	ipStr, err := resolveTargetIP(ctx, target, fp.family)
+	if err != nil {
 		r.Detail = fmt.Sprintf("resolve: %v", err)
 		return r
 	}
 
-	// Pick source IP after resolve so we know the actual address family.
-	// Binding an IPv4 source to an IPv6 target (or vice versa) would fail.
-	if pinger.IPAddr().IP.To4() != nil {
+	pinger := probing.New(ipStr)
+	if net.ParseIP(ipStr).To4() != nil {
+		pinger.SetNetwork("ip4")
 		if sourceIPv4 != "" {
 			pinger.Source = sourceIPv4
 		}
 	} else {
+		pinger.SetNetwork("ip6")
 		if sourceIPv6 != "" {
 			pinger.Source = sourceIPv6
 		}
+	}
+	if err := pinger.Resolve(); err != nil {
+		r.Detail = fmt.Sprintf("resolve: %v", err)
+		return r
 	}
 
 	pinger.SetPrivileged(true) // requires root / CAP_NET_RAW

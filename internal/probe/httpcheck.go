@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,10 +36,6 @@ func doHTTPCheck(ctx context.Context, taskID int, target string, fp famProbe, so
 
 	rawURL := target
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-		// No explicit scheme: guess from the port so a bare "host:443" target
-		// (the common case) doesn't get sent as plaintext HTTP to a TLS-only
-		// listener and fail with a misleading "EOF". Callers who need something
-		// else (e.g. plain HTTP on 443) can always prefix http:// explicitly.
 		scheme := "http"
 		if _, port, err := net.SplitHostPort(target); err == nil && (port == "443" || port == "8443") {
 			scheme = "https"
@@ -56,7 +53,7 @@ func doHTTPCheck(ctx context.Context, taskID int, target string, fp famProbe, so
 	var localAddr net.Addr
 	src := sourceIPForFamily(fp.family, sourceIPv4, sourceIPv6)
 	if src == "" && fp.family == "" {
-		src = pickSourceIP(parsedURL.Hostname(), sourceIPv4, sourceIPv6)
+		src = pickSourceIPContext(ctx, parsedURL.Hostname(), sourceIPv4, sourceIPv6)
 	}
 	if src != "" {
 		localAddr = &net.TCPAddr{IP: net.ParseIP(src)}
@@ -80,14 +77,15 @@ func doHTTPCheck(ctx context.Context, taskID int, target string, fp famProbe, so
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
+			DisableKeepAlives:     true,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 20 * time.Second,
 			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 				return dialer.DialContext(ctx, dialNetwork, addr)
 			},
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: skipTLSVerify}, //nolint:gosec // opt-in per task, for bare-IP/self-signed targets
 		},
 	}
-	// The transport is per-probe and discarded on return; close its keep-alive
-	// connections so file handles don't accumulate until GC on busy tasks.
 	defer client.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -102,6 +100,7 @@ func doHTTPCheck(ctx context.Context, taskID int, target string, fp famProbe, so
 		r.Detail = fmt.Sprintf("http: %v", err)
 		return r
 	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 
 	r.LatencyMs = msPtr(time.Since(start))
